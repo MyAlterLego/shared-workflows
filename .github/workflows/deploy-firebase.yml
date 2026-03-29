@@ -9,21 +9,18 @@ on:
       deploy_command:
         type: string
         default: 'apphosting'
-        description: "'apphosting' for Next.js App Hosting, 'hosting-functions' for Express/Functions"
       app_hosting_backend:
         type: string
         default: ''
-        description: "App Hosting backend name (defaults to firebase_project_id if empty)"
       app_url:
         type: string
         default: ''
+
 jobs:
   deploy:
     name: Firebase Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout code
@@ -48,7 +45,7 @@ jobs:
           firebase apphosting:rollouts:create "$BACKEND" \
             --git-branch main \
             --project ${{ inputs.firebase_project_id }} \
-            --non-interactive 2>&1 || echo "::warning::Rollout trigger returned non-zero — check Firebase console"
+            --non-interactive 2>&1 || echo "::warning::Rollout trigger returned non-zero"
 
       - name: Deploy via Hosting + Functions
         if: inputs.deploy_command == 'hosting-functions'
@@ -57,24 +54,17 @@ jobs:
             --project ${{ inputs.firebase_project_id }} 2>&1
 
       - name: Tag deployed commit
-        id: tag
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           TAG="deploy-$(echo '${{ github.ref_name }}' | tr '/' '-')-${{ github.run_number }}"
           git tag "$TAG" -m "Deployed from ${{ github.ref_name }} commit ${{ github.sha }}"
-          git push origin "$TAG"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          git push origin "$TAG" || echo "::warning::Tag push failed — may need contents:write permission"
 
       - name: Deployment summary
         run: |
           echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Project | ${{ inputs.firebase_project_id }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          if [ -n "${{ inputs.app_url }}" ]; then
-            echo "| App URL | ${{ inputs.app_url }} |" >> $GITHUB_STEP_SUMMARY
-          fi
