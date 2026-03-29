@@ -30,6 +30,9 @@ on:
       needs_server:
         type: boolean
         default: true
+      needs_build:
+        type: boolean
+        default: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -73,6 +76,7 @@ jobs:
         run: npm ci
 
       - name: Build application
+        if: inputs.needs_build
         run: npm run build
 
       - name: Start server
