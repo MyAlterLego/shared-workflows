@@ -17,11 +17,6 @@ on:
       app_url:
         type: string
         default: ''
-    outputs:
-      deploy_tag:
-        description: "Git tag applied to the deployed commit"
-        value: ${{ jobs.deploy.outputs.deploy_tag }}
-
 jobs:
   deploy:
     name: Firebase Deploy
@@ -29,9 +24,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
-
-    outputs:
-      deploy_tag: ${{ steps.tag.outputs.tag }}
 
     steps:
       - name: Checkout code
