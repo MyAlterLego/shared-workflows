@@ -1,0 +1,88 @@
+name: Deploy to Firebase
+
+on:
+  workflow_call:
+    inputs:
+      firebase_project_id:
+        required: true
+        type: string
+      deploy_command:
+        type: string
+        default: 'apphosting'
+        description: "'apphosting' for Next.js App Hosting, 'hosting-functions' for Express/Functions"
+      app_hosting_backend:
+        type: string
+        default: ''
+        description: "App Hosting backend name (defaults to firebase_project_id if empty)"
+      app_url:
+        type: string
+        default: ''
+    outputs:
+      deploy_tag:
+        description: "Git tag applied to the deployed commit"
+        value: ${{ jobs.deploy.outputs.deploy_tag }}
+
+jobs:
+  deploy:
+    name: Firebase Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    outputs:
+      deploy_tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+
+      - name: Deploy via App Hosting
+        if: inputs.deploy_command == 'apphosting'
+        run: |
+          BACKEND="${{ inputs.app_hosting_backend }}"
+          [ -z "$BACKEND" ] && BACKEND="${{ inputs.firebase_project_id }}"
+          firebase apphosting:rollouts:create "$BACKEND" \
+            --git-branch main \
+            --project ${{ inputs.firebase_project_id }} \
+            --non-interactive 2>&1 || echo "::warning::Rollout trigger returned non-zero — check Firebase console"
+
+      - name: Deploy via Hosting + Functions
+        if: inputs.deploy_command == 'hosting-functions'
+        run: |
+          firebase deploy --non-interactive --force \
+            --project ${{ inputs.firebase_project_id }} 2>&1
+
+      - name: Tag deployed commit
+        id: tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TAG="deploy-$(echo '${{ github.ref_name }}' | tr '/' '-')-${{ github.run_number }}"
+          git tag "$TAG" -m "Deployed from ${{ github.ref_name }} commit ${{ github.sha }}"
+          git push origin "$TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | ${{ inputs.firebase_project_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.app_url }}" ]; then
+            echo "| App URL | ${{ inputs.app_url }} |" >> $GITHUB_STEP_SUMMARY
+          fi

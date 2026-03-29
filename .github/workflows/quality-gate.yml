@@ -1,0 +1,122 @@
+name: Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        type: string
+        default: '22'
+      run_qa_tests:
+        type: boolean
+        default: true
+      run_pentest:
+        type: boolean
+        default: true
+      qa_runner_path:
+        type: string
+        default: 'tests/qa/runner-qa.js'
+      pentest_runner_path:
+        type: string
+        default: 'tests/security/runner-pentest.js'
+      master_runner_path:
+        type: string
+        default: 'tests/runner.js'
+      server_port:
+        type: string
+        default: '3001'
+      health_endpoint:
+        type: string
+        default: '/api/health'
+      needs_server:
+        type: boolean
+        default: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  gate:
+    name: Build, Test, Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Start server
+        if: inputs.needs_server
+        run: |
+          PORT=${{ inputs.server_port }} npm start &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          for i in $(seq 1 30); do
+            sleep 2
+            if curl -sf http://localhost:${{ inputs.server_port }}${{ inputs.health_endpoint }} > /dev/null 2>&1; then
+              echo "Server ready after $((i * 2))s"
+              exit 0
+            fi
+            echo "Waiting for server... attempt $i/30"
+          done
+          echo "Server failed to start after 60 seconds"
+          exit 1
+
+      - name: Generate test auth token
+        if: inputs.needs_server
+        id: token
+        run: |
+          if [ -f scripts/generate-test-token.js ]; then
+            TOKEN=$(node scripts/generate-test-token.js)
+            echo "TEST_SESSION_TOKEN=$TOKEN" >> $GITHUB_OUTPUT
+            echo "Auth test token generated"
+          else
+            echo "No token generator found — skipping"
+          fi
+
+      - name: Run QA test suite
+        if: inputs.run_qa_tests
+        env:
+          TEST_SESSION_TOKEN: ${{ steps.token.outputs.TEST_SESSION_TOKEN }}
+          API_BASE_URL: http://localhost:${{ inputs.server_port }}
+        run: node ${{ inputs.qa_runner_path }} 2>&1
+
+      - name: Run penetration test suite
+        if: inputs.run_pentest
+        env:
+          TEST_SESSION_TOKEN: ${{ steps.token.outputs.TEST_SESSION_TOKEN }}
+          API_BASE_URL: http://localhost:${{ inputs.server_port }}
+        run: node ${{ inputs.pentest_runner_path }} 2>&1
+
+      - name: Run master test runner
+        if: inputs.run_qa_tests
+        env:
+          TEST_SESSION_TOKEN: ${{ steps.token.outputs.TEST_SESSION_TOKEN }}
+          API_BASE_URL: http://localhost:${{ inputs.server_port }}
+        run: node ${{ inputs.master_runner_path }} 2>&1
+
+      - name: npm security audit
+        run: npm audit --audit-level=critical
+
+      - name: Stop server
+        if: always() && inputs.needs_server
+        run: kill $SERVER_PID 2>/dev/null || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_number }}
+          path: |
+            tests/**/*.md
+          retention-days: 30

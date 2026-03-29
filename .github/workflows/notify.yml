@@ -1,0 +1,61 @@
+name: Deploy Notification
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        required: true
+        type: string
+        description: "Deploy result: success, failure, cancelled, skipped"
+      project_name:
+        required: true
+        type: string
+      app_url:
+        type: string
+        default: ''
+      version:
+        type: string
+        default: ''
+
+jobs:
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          CHANNEL="${{ secrets.SLACK_CHANNEL }}"
+          CHANNEL="${CHANNEL:-claude-code-alerts}"
+
+          if [ "${{ inputs.status }}" = "success" ]; then
+            EMOJI=":white_check_mark:"
+          else
+            EMOJI=":x:"
+          fi
+
+          TEXT="${EMOJI} *${{ inputs.project_name }}* deploy: *${{ inputs.status }}*"
+
+          if [ -n "${{ inputs.version }}" ]; then
+            TEXT="${TEXT}\nVersion: \`${{ inputs.version }}\`"
+          fi
+
+          if [ -n "${{ inputs.app_url }}" ]; then
+            TEXT="${TEXT}\n<${{ inputs.app_url }}|View live site>"
+          fi
+
+          TEXT="${TEXT}\nBranch: \`${{ github.ref_name }}\` | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+
+          ESCAPED=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$TEXT")
+
+          if [ -n "$SLACK_BOT_TOKEN" ]; then
+            curl -sf --max-time 10 -X POST https://slack.com/api/chat.postMessage \
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"channel\":\"${CHANNEL}\",\"text\":${ESCAPED}}" || echo "::warning::Slack notification failed"
+          else
+            echo "::warning::SLACK_BOT_TOKEN not set — skipping notification"
+            echo "Would have sent: $TEXT"
+          fi
