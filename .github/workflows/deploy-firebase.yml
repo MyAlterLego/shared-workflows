@@ -15,16 +15,37 @@ on:
       app_url:
         type: string
         default: ''
+    outputs:
+      version:
+        description: "Extracted app version from version.ts or version.js"
+        value: ${{ jobs.deploy.outputs.version }}
 
 jobs:
   deploy:
     name: Firebase Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.APP_VERSION }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          # Try version.ts first (Next.js projects), then version.js, then package.json
+          if [ -f "src/lib/version.ts" ]; then
+            VER=$(grep -oP "APP_VERSION\s*=\s*'[^']*'" src/lib/version.ts | grep -oP "'[^']*'" | tr -d "'")
+          elif [ -f "public/js/version.js" ]; then
+            VER=$(grep -oP "APP_VERSION\s*=\s*'[^']*'" public/js/version.js | grep -oP "'[^']*'" | tr -d "'")
+          elif [ -f "package.json" ]; then
+            VER=$(node -p "require('./package.json').version" 2>/dev/null)
+          fi
+          VER="${VER:-unknown}"
+          echo "APP_VERSION=$VER" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VER"
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -60,8 +81,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          VER="${{ steps.version.outputs.APP_VERSION }}"
           TAG="deploy-$(echo '${{ github.ref_name }}' | tr '/' '-')-${{ github.run_number }}"
-          git tag "$TAG" -m "Deployed from ${{ github.ref_name }} commit ${{ github.sha }}"
+          git tag "$TAG" -m "Deployed $VER from ${{ github.ref_name }} commit ${{ github.sha }}"
           git push origin "$TAG" || echo "::warning::Tag push failed — may need contents:write permission"
 
       - name: Deployment summary
@@ -70,4 +92,5 @@ jobs:
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Project | ${{ inputs.firebase_project_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.version.outputs.APP_VERSION }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY

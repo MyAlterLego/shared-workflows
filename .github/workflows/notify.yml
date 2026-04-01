@@ -16,6 +16,9 @@ on:
       version:
         type: string
         default: ''
+      commit_message:
+        type: string
+        default: ''
 
 jobs:
   notify:
@@ -26,32 +29,127 @@ jobs:
       - name: Send Slack notification
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
         run: |
           if [ "${{ inputs.status }}" = "success" ]; then
             EMOJI=":white_check_mark:"
-            COLOR="good"
-          else
+            STATUS_TEXT="deployed successfully"
+            COLOR="#2ecc71"
+          elif [ "${{ inputs.status }}" = "failure" ]; then
             EMOJI=":x:"
-            COLOR="danger"
+            STATUS_TEXT="deploy failed"
+            COLOR="#e74c3c"
+          elif [ "${{ inputs.status }}" = "cancelled" ]; then
+            EMOJI=":no_entry_sign:"
+            STATUS_TEXT="deploy cancelled"
+            COLOR="#f39c12"
+          else
+            EMOJI=":warning:"
+            STATUS_TEXT="deploy ${{ inputs.status }}"
+            COLOR="#95a5a6"
           fi
 
-          TEXT="${EMOJI} *${{ inputs.project_name }}* deploy: *${{ inputs.status }}*"
-
-          if [ -n "${{ inputs.version }}" ]; then
-            TEXT="${TEXT}\nVersion: \`${{ inputs.version }}\`"
+          # Build version line
+          VERSION_LINE=""
+          if [ -n "${{ inputs.version }}" ] && [ "${{ inputs.version }}" != "unknown" ]; then
+            VERSION_LINE="\`${{ inputs.version }}\`"
           fi
 
-          if [ -n "${{ inputs.app_url }}" ]; then
-            TEXT="${TEXT}\n<${{ inputs.app_url }}|View live site>"
+          # Build commit message line (first line only, truncated)
+          COMMIT_MSG="${{ inputs.commit_message }}"
+          if [ -z "$COMMIT_MSG" ]; then
+            COMMIT_MSG="${{ github.event.head_commit.message }}"
+          fi
+          # Take first line only and truncate to 100 chars
+          COMMIT_LINE=$(echo "$COMMIT_MSG" | head -1 | cut -c1-100)
+
+          # ── Try Slack Bot API first (supports threading) ──
+          if [ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ]; then
+            # Build fields array
+            FIELDS='['
+            if [ -n "$VERSION_LINE" ]; then
+              FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Version*\n${VERSION_LINE}\"},"
+            fi
+            FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Branch*\n\`${{ github.ref_name }}\`\"},"
+            FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Commit*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${GITHUB_SHA:0:7}>\"}"
+            FIELDS="${FIELDS}]"
+
+            # Build blocks
+            BLOCKS='[
+              {"type":"section","text":{"type":"mrkdwn","text":"'"${EMOJI} *${{ inputs.project_name }}* ${STATUS_TEXT}"'"}},
+              {"type":"section","fields":'"${FIELDS}"'}'
+
+            # Add commit message context
+            if [ -n "$COMMIT_LINE" ]; then
+              COMMIT_ESCAPED=$(echo "$COMMIT_LINE" | sed 's/"/\\"/g' | sed "s/'/\\\\'/g")
+              BLOCKS="${BLOCKS},"'{"type":"context","elements":[{"type":"mrkdwn","text":"'"${COMMIT_ESCAPED}"'"}]}'
+            fi
+
+            # Add app URL + actions link
+            ACTIONS='{"type":"actions","elements":['
+            ACTIONS_ITEMS=""
+            if [ -n "${{ inputs.app_url }}" ]; then
+              ACTIONS_ITEMS='{"type":"button","text":{"type":"plain_text","text":"View Site"},"url":"${{ inputs.app_url }}"}'
+            fi
+            ACTIONS_ITEMS="${ACTIONS_ITEMS:+${ACTIONS_ITEMS},}"'{"type":"button","text":{"type":"plain_text","text":"View Run"},"url":"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+            ACTIONS="${ACTIONS}${ACTIONS_ITEMS}]}"
+            BLOCKS="${BLOCKS},${ACTIONS}]"
+
+            # Post initial message
+            RESPONSE=$(curl -sf --max-time 10 -X POST "https://slack.com/api/chat.postMessage" \
+              -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"channel\":\"${SLACK_CHANNEL_ID}\",\"blocks\":${BLOCKS},\"text\":\"${EMOJI} ${{ inputs.project_name }} ${STATUS_TEXT}\"}" 2>/dev/null)
+
+            # Extract thread_ts for reply
+            THREAD_TS=$(echo "$RESPONSE" | grep -oP '"ts"\s*:\s*"\K[^"]+' | head -1)
+
+            # Post thread reply with deployment confirmation
+            if [ -n "$THREAD_TS" ] && [ "${{ inputs.status }}" = "success" ]; then
+              THREAD_TEXT=":firebase: Firebase deployment confirmed for *${{ inputs.project_name }}*"
+              if [ -n "$VERSION_LINE" ]; then
+                THREAD_TEXT="${THREAD_TEXT} ${VERSION_LINE}"
+              fi
+              if [ -n "${{ inputs.app_url }}" ]; then
+                THREAD_TEXT="${THREAD_TEXT}\n:globe_with_meridians: Live at <${{ inputs.app_url }}>"
+              fi
+
+              curl -sf --max-time 10 -X POST "https://slack.com/api/chat.postMessage" \
+                -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"channel\":\"${SLACK_CHANNEL_ID}\",\"thread_ts\":\"${THREAD_TS}\",\"text\":\"$(echo "$THREAD_TEXT" | sed 's/"/\\"/g')\"}" > /dev/null 2>&1 || echo "::warning::Thread reply failed"
+            fi
+
+            echo "Sent via Slack Bot API with thread reply"
+            exit 0
           fi
 
-          TEXT="${TEXT}\nBranch: \`${{ github.ref_name }}\` | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
-
+          # ── Fallback: Slack Incoming Webhook (no threading) ──
           if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            TEXT="${EMOJI} *${{ inputs.project_name }}* ${STATUS_TEXT}"
+
+            if [ -n "$VERSION_LINE" ]; then
+              TEXT="${TEXT}  |  ${VERSION_LINE}"
+            fi
+
+            if [ -n "$COMMIT_LINE" ]; then
+              COMMIT_ESCAPED=$(echo "$COMMIT_LINE" | sed 's/"/\\"/g')
+              TEXT="${TEXT}\n> ${COMMIT_ESCAPED}"
+            fi
+
+            TEXT="${TEXT}\nBranch: \`${{ github.ref_name }}\`  |  <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+
+            if [ -n "${{ inputs.app_url }}" ]; then
+              TEXT="${TEXT}  |  <${{ inputs.app_url }}|View site>"
+            fi
+
             curl -sf --max-time 10 -X POST "$SLACK_WEBHOOK_URL" \
               -H "Content-Type: application/json" \
-              -d "{\"text\":\"$(echo "$TEXT" | sed 's/"/\\"/g')\"}" || echo "::warning::Slack notification failed"
+              -d "{\"text\":\"$(echo "$TEXT" | sed 's/"/\\"/g')\"}" || echo "::warning::Slack webhook notification failed"
+
+            echo "Sent via Incoming Webhook (no threading — add SLACK_BOT_TOKEN + SLACK_CHANNEL_ID for threads)"
           else
-            echo "::warning::SLACK_WEBHOOK_URL not set — skipping notification"
-            echo "Would have sent: $TEXT"
+            echo "::warning::No Slack credentials set — skipping notification"
+            echo "Set SLACK_WEBHOOK_URL for basic notifications, or SLACK_BOT_TOKEN + SLACK_CHANNEL_ID for rich notifications with threading"
           fi
