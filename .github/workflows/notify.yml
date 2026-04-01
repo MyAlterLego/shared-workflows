@@ -26,11 +26,41 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Fetch Slack credentials from CRDB
+        id: slack-creds
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::warning::DATABASE_URL not set — cannot fetch Slack credentials from CRDB"
+            echo "BOT_TOKEN=" >> $GITHUB_OUTPUT
+            echo "CHANNEL_ID=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Query settings table for slack credentials
+          BOT_TOKEN=$(psql "$DATABASE_URL" -t -A -c "SELECT value FROM settings WHERE key = 'slack_bot_token'" 2>/dev/null || echo "")
+          CHANNEL_ID=$(psql "$DATABASE_URL" -t -A -c "SELECT value FROM settings WHERE key = 'slack_channel_id'" 2>/dev/null || echo "")
+
+          # Mask the bot token so it doesn't appear in logs
+          if [ -n "$BOT_TOKEN" ]; then
+            echo "::add-mask::$BOT_TOKEN"
+          fi
+
+          echo "BOT_TOKEN=$BOT_TOKEN" >> $GITHUB_OUTPUT
+          echo "CHANNEL_ID=$CHANNEL_ID" >> $GITHUB_OUTPUT
+
+          if [ -n "$BOT_TOKEN" ] && [ -n "$CHANNEL_ID" ]; then
+            echo "Slack Bot credentials loaded from CRDB"
+          else
+            echo "Slack Bot credentials not found in CRDB — will fall back to webhook"
+          fi
+
       - name: Send Slack notification
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_BOT_TOKEN: ${{ steps.slack-creds.outputs.BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ steps.slack-creds.outputs.CHANNEL_ID }}
         run: |
           if [ "${{ inputs.status }}" = "success" ]; then
             EMOJI=":white_check_mark:"
@@ -61,7 +91,6 @@ jobs:
           if [ -z "$COMMIT_MSG" ]; then
             COMMIT_MSG="${{ github.event.head_commit.message }}"
           fi
-          # Take first line only and truncate to 100 chars
           COMMIT_LINE=$(echo "$COMMIT_MSG" | head -1 | cut -c1-100)
 
           # ── Try Slack Bot API first (supports threading) ──
@@ -121,7 +150,7 @@ jobs:
                 -d "{\"channel\":\"${SLACK_CHANNEL_ID}\",\"thread_ts\":\"${THREAD_TS}\",\"text\":\"$(echo "$THREAD_TEXT" | sed 's/"/\\"/g')\"}" > /dev/null 2>&1 || echo "::warning::Thread reply failed"
             fi
 
-            echo "Sent via Slack Bot API with thread reply"
+            echo "Sent via Slack Bot API (credentials from CRDB) with thread reply"
             exit 0
           fi
 
@@ -148,8 +177,8 @@ jobs:
               -H "Content-Type: application/json" \
               -d "{\"text\":\"$(echo "$TEXT" | sed 's/"/\\"/g')\"}" || echo "::warning::Slack webhook notification failed"
 
-            echo "Sent via Incoming Webhook (no threading — add SLACK_BOT_TOKEN + SLACK_CHANNEL_ID for threads)"
+            echo "Sent via Incoming Webhook (add slack_bot_token + slack_channel_id to CRDB settings for rich notifications with threading)"
           else
-            echo "::warning::No Slack credentials set — skipping notification"
-            echo "Set SLACK_WEBHOOK_URL for basic notifications, or SLACK_BOT_TOKEN + SLACK_CHANNEL_ID for rich notifications with threading"
+            echo "::warning::No Slack credentials found — skipping notification"
+            echo "Add slack_bot_token + slack_channel_id to CRDB settings table, or set SLACK_WEBHOOK_URL as a GitHub secret"
           fi
