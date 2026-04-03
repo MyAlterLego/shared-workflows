@@ -61,35 +61,45 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_BOT_TOKEN: ${{ steps.slack-creds.outputs.BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ steps.slack-creds.outputs.CHANNEL_ID }}
+          INPUT_STATUS: ${INPUT_STATUS}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_COMMIT_MESSAGE: ${{ inputs.commit_message }}
+          INPUT_PROJECT_NAME: ${INPUT_PROJECT_NAME}
+          INPUT_APP_URL: ${INPUT_APP_URL}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          GH_SHA: ${{ github.sha }}
+          GH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
         run: |
-          if [ "${{ inputs.status }}" = "success" ]; then
+          if [ "$INPUT_STATUS" = "success" ]; then
             EMOJI=":white_check_mark:"
             STATUS_TEXT="deployed successfully"
             COLOR="#2ecc71"
-          elif [ "${{ inputs.status }}" = "failure" ]; then
+          elif [ "$INPUT_STATUS" = "failure" ]; then
             EMOJI=":x:"
             STATUS_TEXT="deploy failed"
             COLOR="#e74c3c"
-          elif [ "${{ inputs.status }}" = "cancelled" ]; then
+          elif [ "$INPUT_STATUS" = "cancelled" ]; then
             EMOJI=":no_entry_sign:"
             STATUS_TEXT="deploy cancelled"
             COLOR="#f39c12"
           else
             EMOJI=":warning:"
-            STATUS_TEXT="deploy ${{ inputs.status }}"
+            STATUS_TEXT="deploy ${INPUT_STATUS}"
             COLOR="#95a5a6"
           fi
 
           # Build version line
           VERSION_LINE=""
-          if [ -n "${{ inputs.version }}" ] && [ "${{ inputs.version }}" != "unknown" ]; then
-            VERSION_LINE="\`${{ inputs.version }}\`"
+          if [ -n "$INPUT_VERSION" ] && [ "$INPUT_VERSION" != "unknown" ]; then
+            VERSION_LINE="\`${INPUT_VERSION}\`"
           fi
 
           # Build commit message line (first line only, truncated)
-          COMMIT_MSG="${{ inputs.commit_message }}"
+          COMMIT_MSG="$INPUT_COMMIT_MESSAGE"
           if [ -z "$COMMIT_MSG" ]; then
-            COMMIT_MSG="${{ github.event.head_commit.message }}"
+            COMMIT_MSG="$HEAD_COMMIT_MESSAGE"
           fi
           COMMIT_LINE=$(echo "$COMMIT_MSG" | head -1 | cut -c1-100)
 
@@ -100,13 +110,13 @@ jobs:
             if [ -n "$VERSION_LINE" ]; then
               FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Version*\n${VERSION_LINE}\"},"
             fi
-            FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Branch*\n\`${{ github.ref_name }}\`\"},"
-            FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Commit*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${GITHUB_SHA:0:7}>\"}"
+            FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Branch*\n\`${GH_REF_NAME}\`\"},"
+            FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Commit*\n<${GH_COMMIT_URL}|${GH_SHA:0:7}>\"}"
             FIELDS="${FIELDS}]"
 
             # Build blocks
             BLOCKS='[
-              {"type":"section","text":{"type":"mrkdwn","text":"'"${EMOJI} *${{ inputs.project_name }}* ${STATUS_TEXT}"'"}},
+              {"type":"section","text":{"type":"mrkdwn","text":"'"${EMOJI} *${INPUT_PROJECT_NAME}* ${STATUS_TEXT}"'"}},
               {"type":"section","fields":'"${FIELDS}"'}'
 
             # Add commit message context
@@ -118,10 +128,10 @@ jobs:
             # Add app URL + actions link
             ACTIONS='{"type":"actions","elements":['
             ACTIONS_ITEMS=""
-            if [ -n "${{ inputs.app_url }}" ]; then
-              ACTIONS_ITEMS='{"type":"button","text":{"type":"plain_text","text":"View Site"},"url":"${{ inputs.app_url }}"}'
+            if [ -n "${INPUT_APP_URL}" ]; then
+              ACTIONS_ITEMS='{"type":"button","text":{"type":"plain_text","text":"View Site"},"url":"'"${INPUT_APP_URL}"'"}'
             fi
-            ACTIONS_ITEMS="${ACTIONS_ITEMS:+${ACTIONS_ITEMS},}"'{"type":"button","text":{"type":"plain_text","text":"View Run"},"url":"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+            ACTIONS_ITEMS="${ACTIONS_ITEMS:+${ACTIONS_ITEMS},}"'{"type":"button","text":{"type":"plain_text","text":"View Run"},"url":"'"${GH_RUN_URL}"'"}'
             ACTIONS="${ACTIONS}${ACTIONS_ITEMS}]}"
             BLOCKS="${BLOCKS},${ACTIONS}]"
 
@@ -129,19 +139,19 @@ jobs:
             RESPONSE=$(curl -sf --max-time 10 -X POST "https://slack.com/api/chat.postMessage" \
               -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
               -H "Content-Type: application/json" \
-              -d "{\"channel\":\"${SLACK_CHANNEL_ID}\",\"blocks\":${BLOCKS},\"text\":\"${EMOJI} ${{ inputs.project_name }} ${STATUS_TEXT}\"}" 2>/dev/null)
+              -d "{\"channel\":\"${SLACK_CHANNEL_ID}\",\"blocks\":${BLOCKS},\"text\":\"${EMOJI} ${INPUT_PROJECT_NAME} ${STATUS_TEXT}\"}" 2>/dev/null)
 
             # Extract thread_ts for reply
             THREAD_TS=$(echo "$RESPONSE" | grep -oP '"ts"\s*:\s*"\K[^"]+' | head -1)
 
             # Post thread reply with deployment confirmation
-            if [ -n "$THREAD_TS" ] && [ "${{ inputs.status }}" = "success" ]; then
-              THREAD_TEXT=":firebase: Firebase deployment confirmed for *${{ inputs.project_name }}*"
+            if [ -n "$THREAD_TS" ] && [ "${INPUT_STATUS}" = "success" ]; then
+              THREAD_TEXT=":firebase: Firebase deployment confirmed for *${INPUT_PROJECT_NAME}*"
               if [ -n "$VERSION_LINE" ]; then
                 THREAD_TEXT="${THREAD_TEXT} ${VERSION_LINE}"
               fi
-              if [ -n "${{ inputs.app_url }}" ]; then
-                THREAD_TEXT="${THREAD_TEXT}\n:globe_with_meridians: Live at <${{ inputs.app_url }}>"
+              if [ -n "${INPUT_APP_URL}" ]; then
+                THREAD_TEXT="${THREAD_TEXT}\n:globe_with_meridians: Live at <${INPUT_APP_URL}>"
               fi
 
               curl -sf --max-time 10 -X POST "https://slack.com/api/chat.postMessage" \
@@ -156,7 +166,7 @@ jobs:
 
           # ── Fallback: Slack Incoming Webhook (no threading) ──
           if [ -n "$SLACK_WEBHOOK_URL" ]; then
-            TEXT="${EMOJI} *${{ inputs.project_name }}* ${STATUS_TEXT}"
+            TEXT="${EMOJI} *${INPUT_PROJECT_NAME}* ${STATUS_TEXT}"
 
             if [ -n "$VERSION_LINE" ]; then
               TEXT="${TEXT}  |  ${VERSION_LINE}"
@@ -167,10 +177,10 @@ jobs:
               TEXT="${TEXT}\n> ${COMMIT_ESCAPED}"
             fi
 
-            TEXT="${TEXT}\nBranch: \`${{ github.ref_name }}\`  |  <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            TEXT="${TEXT}\nBranch: \`${GH_REF_NAME}\`  |  <${GH_RUN_URL}|View run>"
 
-            if [ -n "${{ inputs.app_url }}" ]; then
-              TEXT="${TEXT}  |  <${{ inputs.app_url }}|View site>"
+            if [ -n "${INPUT_APP_URL}" ]; then
+              TEXT="${TEXT}  |  <${INPUT_APP_URL}|View site>"
             fi
 
             curl -sf --max-time 10 -X POST "$SLACK_WEBHOOK_URL" \
