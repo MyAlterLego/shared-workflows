@@ -28,6 +28,9 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.APP_VERSION }}
 
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
