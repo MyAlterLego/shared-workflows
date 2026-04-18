@@ -59,6 +59,7 @@ jobs:
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GH_PAT: ${{ secrets.GH_PAT || github.token }}
+      NODE_AUTH_TOKEN: ${{ secrets.GH_PAT || github.token }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
       WEBSITE_GITHUB_REPO: ${{ secrets.WEBSITE_GITHUB_REPO }}
