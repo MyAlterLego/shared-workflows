@@ -37,6 +37,10 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+permissions:
+  packages: read
+  contents: read
+
 jobs:
   gate:
     name: Build, Test, Audit
