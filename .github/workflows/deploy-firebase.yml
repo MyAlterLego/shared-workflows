@@ -20,6 +20,10 @@ on:
         description: "Extracted app version from version.ts or version.js"
         value: ${{ jobs.deploy.outputs.version }}
 
+permissions:
+  packages: read
+  contents: write
+
 jobs:
   deploy:
     name: Firebase Deploy
@@ -29,7 +33,7 @@ jobs:
       version: ${{ steps.version.outputs.APP_VERSION }}
 
     env:
-      GH_PAT: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT || github.token }}
 
     steps:
       - name: Checkout code
