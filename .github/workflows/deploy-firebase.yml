@@ -85,7 +85,7 @@ jobs:
           firebase apphosting:rollouts:create "$BACKEND" \
             --git-branch main \
             --project ${{ inputs.firebase_project_id }} \
-            --non-interactive 2>&1 || echo "::warning::Rollout trigger returned non-zero"
+            --non-interactive 2>&1
 
       - name: Deploy via Hosting + Functions
         if: inputs.deploy_command == 'hosting-functions'
