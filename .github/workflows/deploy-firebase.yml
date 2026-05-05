@@ -61,12 +61,16 @@ jobs:
       - name: Extract version
         id: version
         run: |
-          # Try version.ts first (Next.js projects), then version.js, then package.json
+          # Try version.ts first (Next.js projects), then version.js, then package.json.
+          # Fall through to package.json if version.ts/js exists but grep returns empty
+          # (e.g. when APP_VERSION is derived from process.env rather than a literal string).
+          VER=""
           if [ -f "src/lib/version.ts" ]; then
             VER=$(grep -oP "APP_VERSION\s*=\s*'[^']*'" src/lib/version.ts | grep -oP "'[^']*'" | tr -d "'")
           elif [ -f "public/js/version.js" ]; then
             VER=$(grep -oP "APP_VERSION\s*=\s*'[^']*'" public/js/version.js | grep -oP "'[^']*'" | tr -d "'")
-          elif [ -f "package.json" ]; then
+          fi
+          if [ -z "$VER" ] && [ -f "package.json" ]; then
             VER=$(node -p "require('./package.json').version" 2>/dev/null)
           fi
           VER="${VER:-unknown}"
