@@ -1,0 +1,372 @@
+# Reusable promote-branch workflow.
+# Rebases a feature branch onto target_branch, runs inline CI, and merges with --no-ff.
+# POSTs result (merged | conflict | ci_failed) to admin's /api/platform/promote-callback.
+#
+# WORKFLOW-04 / WORKFLOW-05 (v2.0 milestone Phase 4).
+# Decision refs: 04-CONTEXT.md D-01 through D-15.
+#
+# CRITICAL: Conflict files MUST be captured BEFORE `git rebase --abort` (RESEARCH Critical Finding #1).
+# CRITICAL: CI is INLINED here — nested workflow_call to quality-gate.yml is impossible (RESEARCH Critical Finding #2).
+
+name: Promote Branch
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 'Feature branch to promote (will be rebased onto target_branch).'
+        required: true
+        type: string
+      target_branch:
+        description: 'Target branch (almost always main).'
+        required: false
+        type: string
+        default: 'main'
+      admin_callback_url:
+        description: 'Base URL for admin control plane.'
+        required: false
+        type: string
+        default: 'https://admin.triarch.dev'
+    secrets:
+      ADMIN_API_TOKEN:
+        description: 'Per-project Bearer token for admin callback.'
+        required: true
+      GH_PAT:
+        description: 'Optional PAT for pushing past branch protection. Falls back to github.token.'
+        required: false
+      DATABASE_URL:
+        description: 'Database connection URL for CI tests.'
+        required: false
+      NEXTAUTH_SECRET:
+        description: 'NextAuth secret for CI tests.'
+        required: false
+      ADMIN_EMAIL:
+        description: 'Admin email for CI tests.'
+        required: false
+      GOOGLE_CLIENT_ID:
+        description: 'Google OAuth client ID for CI tests.'
+        required: false
+      GOOGLE_CLIENT_SECRET:
+        description: 'Google OAuth client secret for CI tests.'
+        required: false
+      GEMINI_API_KEY:
+        description: 'Gemini API key for CI tests.'
+        required: false
+      ANTHROPIC_API_KEY:
+        description: 'Anthropic API key for CI tests.'
+        required: false
+      FIREBASE_STORAGE_BUCKET:
+        description: 'Firebase storage bucket for CI tests.'
+        required: false
+      WEBSITE_GITHUB_REPO:
+        description: 'Website GitHub repo for CI tests.'
+        required: false
+      PORTAL_JWT_SECRET:
+        description: 'Portal JWT secret for CI tests.'
+        required: false
+      PORTAL_TOTP_ENCRYPTION_KEY:
+        description: 'Portal TOTP encryption key for CI tests.'
+        required: false
+    outputs:
+      result:
+        description: 'merged | conflict | ci_failed'
+        value: ${{ jobs.callback.outputs.result }}
+      merge_sha:
+        description: 'Merge commit SHA when result=merged'
+        value: ${{ jobs.merge.outputs.merge_sha }}
+      conflict_files:
+        description: 'Newline-separated list of conflicting files when result=conflict'
+        value: ${{ jobs.rebase.outputs.conflict_files }}
+      ci_run_url:
+        description: 'CI run URL when result=ci_failed'
+        value: ${{ jobs.ci.outputs.run_url }}
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Feature branch to promote.'
+        required: true
+        type: string
+      target_branch:
+        description: 'Target branch (defaults to main).'
+        required: false
+        type: string
+        default: 'main'
+      admin_callback_url:
+        description: 'Admin callback base URL.'
+        required: false
+        type: string
+        default: 'https://admin.triarch.dev'
+
+# CRITICAL (RESEARCH Pitfall 4): Concurrency MUST be declared inside this workflow.
+# Concurrency on the calling workflow does NOT propagate into reusable workflows.
+# Use inputs.target_branch (NOT github.event) — github.event is the caller's event.
+concurrency:
+  group: "promote-${{ inputs.target_branch }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # required for git push to main
+  packages: read    # required for npm ci against GitHub Packages registry
+
+jobs:
+  # ── Job 1: Rebase the feature branch onto target_branch ──
+  rebase:
+    name: Rebase onto ${{ inputs.target_branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rebased_sha: ${{ steps.rebase.outputs.rebased_sha }}
+      conflict_files: ${{ steps.rebase.outputs.conflict_files }}
+      rebase_error: ${{ steps.rebase.outputs.rebase_error }}
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch target branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: git fetch origin "$TARGET_BRANCH"
+
+      - name: Rebase (capture conflicts BEFORE abort)
+        id: rebase
+        env:
+          BRANCH: ${{ inputs.branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          # CRITICAL: capture-before-abort sequence (RESEARCH Critical Finding #1).
+          # `git rebase --abort` resets the working tree, clearing all conflict markers.
+          # `git diff --name-only --diff-filter=U` returns empty AFTER abort.
+          set +e
+          git rebase "origin/$TARGET_BRANCH"
+          REBASE_EXIT=$?
+          set -e
+
+          if [ "$REBASE_EXIT" -ne 0 ]; then
+            # Working tree is currently in conflicted state. Capture immediately.
+            CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+            REBASE_ERROR=$(cat .git/rebase-merge/patch 2>/dev/null | head -3 || echo "rebase conflict")
+
+            # NOW we can abort safely.
+            git rebase --abort || true
+
+            # Multi-line outputs use the GitHub Actions delimiter syntax.
+            {
+              echo "conflict_files<<EOF"
+              echo "$CONFLICT_FILES"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "rebase_error<<EOF"
+              echo "$REBASE_ERROR"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            echo "::error::Rebase failed. Conflicting files: $CONFLICT_FILES"
+            exit 1
+          fi
+
+          # Rebase succeeded. Force-push the rebased branch ref so the merge job's checkout sees it
+          # (RESEARCH Pitfall 2 — Detached HEAD After Rebase).
+          REBASED_SHA=$(git rev-parse HEAD)
+          echo "rebased_sha=$REBASED_SHA" >> "$GITHUB_OUTPUT"
+          git push --force-with-lease origin "$BRANCH"
+
+          echo "## Rebase Result" >> "$GITHUB_STEP_SUMMARY"
+          echo "Branch \`$BRANCH\` rebased cleanly onto \`origin/$TARGET_BRANCH\`. New SHA: \`$REBASED_SHA\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Job 2: Inline CI (build + vitest). RESEARCH Critical Finding #2 — nested workflow_call impossible. ──
+  ci:
+    name: Build + Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: rebase
+    outputs:
+      run_url: ${{ steps.run_url.outputs.url }}
+    # Mirror quality-gate.yml's env block — secrets passed via workflow_call secrets: block above.
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
+      ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GH_PAT: ${{ secrets.GH_PAT || github.token }}
+      NODE_AUTH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
+      WEBSITE_GITHUB_REPO: ${{ secrets.WEBSITE_GITHUB_REPO }}
+      PORTAL_JWT_SECRET: ${{ secrets.PORTAL_JWT_SECRET }}
+      PORTAL_TOTP_ENCRYPTION_KEY: ${{ secrets.PORTAL_TOTP_ENCRYPTION_KEY }}
+    steps:
+      - name: Checkout rebased branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://npm.pkg.github.com'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: npx vitest run
+
+      - name: Capture run URL
+        id: run_url
+        run: |
+          URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+  # ── Job 3: Merge rebased branch into target_branch with --no-ff (D-05). ──
+  merge:
+    name: Merge ${{ inputs.branch }} -> ${{ inputs.target_branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [rebase, ci]
+    outputs:
+      merge_sha: ${{ steps.merge.outputs.merge_sha }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.target_branch }}
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge --no-ff and push
+        id: merge
+        env:
+          BRANCH: ${{ inputs.branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          # Pull latest target_branch so local is current.
+          git pull origin "$TARGET_BRANCH"
+          # Fetch the rebased branch ref (the rebase job force-pushed it).
+          git fetch origin "$BRANCH"
+          # --no-ff preserves merge commit visible in `git log --first-parent` (D-05).
+          git merge --no-ff "origin/$BRANCH" -m "Promote $BRANCH"
+          MERGE_SHA=$(git rev-parse HEAD)
+          git push origin "$TARGET_BRANCH"
+          echo "merge_sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+          echo "## Merge Result" >> "$GITHUB_STEP_SUMMARY"
+          echo "Branch \`$BRANCH\` merged into \`$TARGET_BRANCH\` at \`$MERGE_SHA\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Job 4: Callback to admin — runs ALWAYS so all terminal states (merged/conflict/ci_failed) are reported (RESEARCH Pattern 2). ──
+  callback:
+    name: Notify admin
+    runs-on: ubuntu-latest
+    needs: [rebase, ci, merge]
+    if: always()
+    outputs:
+      result: ${{ steps.callback.outputs.result }}
+    steps:
+      - name: Post promote-branch result to admin
+        id: callback
+        continue-on-error: true   # D-09 — callback is best-effort, merge is source of truth
+        env:
+          ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
+          ADMIN_CALLBACK_URL: ${{ inputs.admin_callback_url }}
+          BRANCH: ${{ inputs.branch }}
+          MERGE_RESULT: ${{ needs.merge.result }}
+          REBASE_RESULT: ${{ needs.rebase.result }}
+          CI_RESULT: ${{ needs.ci.result }}
+          MERGE_SHA: ${{ needs.merge.outputs.merge_sha }}
+          CONFLICT_FILES: ${{ needs.rebase.outputs.conflict_files }}
+          REBASE_ERROR: ${{ needs.rebase.outputs.rebase_error }}
+          CI_RUN_URL: ${{ needs.ci.outputs.run_url }}
+        run: |
+          # Pitfall 5: Empty-token guard — verbatim from deploy-firebase.yml lines 158-163.
+          if [ -z "$ADMIN_API_TOKEN" ]; then
+            echo "::warning::ADMIN_API_TOKEN not set on consumer repo — promote callback skipped."
+            {
+              echo "## Admin Callback (promote)"
+              echo "Skipped: ADMIN_API_TOKEN not set."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Determine result enum from job outcomes (RESEARCH Pattern 2).
+          if [ "$MERGE_RESULT" = "success" ]; then
+            RESULT="merged"
+          elif [ "$REBASE_RESULT" = "failure" ]; then
+            RESULT="conflict"
+          else
+            RESULT="ci_failed"
+          fi
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+
+          # Build payload using jq for safe JSON construction (handles newlines, quotes, nulls).
+          CONFLICT_FILES_JSON="[]"
+          if [ "$RESULT" = "conflict" ] && [ -n "$CONFLICT_FILES" ]; then
+            # Convert newline-separated list to JSON array.
+            CONFLICT_FILES_JSON=$(echo "$CONFLICT_FILES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+
+          MERGE_SHA_JSON="null"
+          [ "$RESULT" = "merged" ] && [ -n "$MERGE_SHA" ] && MERGE_SHA_JSON=$(printf '"%s"' "$MERGE_SHA")
+
+          REBASE_ERROR_JSON="null"
+          if [ "$RESULT" = "conflict" ] && [ -n "$REBASE_ERROR" ]; then
+            REBASE_ERROR_JSON=$(echo "$REBASE_ERROR" | jq -R -s -c .)
+          fi
+
+          CI_RUN_URL_JSON="null"
+          [ "$RESULT" = "ci_failed" ] && [ -n "$CI_RUN_URL" ] && CI_RUN_URL_JSON=$(printf '"%s"' "$CI_RUN_URL")
+
+          PAYLOAD=$(printf '{"branch":"%s","result":"%s","merge_sha":%s,"conflict_files":%s,"rebase_error":%s,"ci_run_url":%s}' \
+            "$BRANCH" \
+            "$RESULT" \
+            "$MERGE_SHA_JSON" \
+            "$CONFLICT_FILES_JSON" \
+            "$REBASE_ERROR_JSON" \
+            "$CI_RUN_URL_JSON")
+
+          # POST + capture body and code separately (verbatim from deploy-prod.yml lines 178-191).
+          RESP_BODY=$(mktemp)
+          HTTP_CODE=$(curl -s --max-time 10 -o "$RESP_BODY" -w "%{http_code}" \
+            -X POST "${ADMIN_CALLBACK_URL}/api/platform/promote-callback" \
+            -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" || echo "000")
+
+          if [ "$HTTP_CODE" = "201" ]; then
+            echo "Admin promote callback succeeded (HTTP 201) for $BRANCH result=$RESULT."
+          else
+            RESP_TEXT=$(head -c 500 "$RESP_BODY")
+            echo "::warning::Admin promote callback failed (HTTP $HTTP_CODE) for $BRANCH result=$RESULT. Response: ${RESP_TEXT}"
+          fi
+          rm -f "$RESP_BODY"
+
+          {
+            echo "## Admin Callback (promote)"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Endpoint | \`${ADMIN_CALLBACK_URL}/api/platform/promote-callback\` |"
+            echo "| HTTP Status | $HTTP_CODE |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Result | \`$RESULT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
