@@ -25,6 +25,11 @@ on:
         required: false
         type: string
         default: 'https://admin.triarch.dev'
+      environment:
+        description: 'Deployment environment: dev or prod. Default prod for backwards compatibility.'
+        required: false
+        type: string
+        default: 'prod'
     secrets:
       FIREBASE_SA_KEY:
         required: true
@@ -102,14 +107,39 @@ jobs:
       - name: Deploy via App Hosting (main branch)
         id: deploy_apphosting_main
         if: inputs.deploy_command == 'apphosting' && (inputs.git_branch == '' || inputs.git_branch == 'main')
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          FIREBASE_PROJECT_ID: ${{ inputs.firebase_project_id }}
+          APP_HOSTING_BACKEND: ${{ inputs.app_hosting_backend }}
+          INPUT_GIT_BRANCH: ${{ inputs.git_branch }}
         run: |
-          BACKEND="${{ inputs.app_hosting_backend }}"
-          [ -z "$BACKEND" ] && BACKEND="${{ inputs.firebase_project_id }}"
-          echo "Rolling out main branch to backend $BACKEND in project ${{ inputs.firebase_project_id }}"
-          firebase apphosting:rollouts:create "$BACKEND" \
-            --git-branch main \
-            --project ${{ inputs.firebase_project_id }} \
-            --non-interactive 2>&1
+          BACKEND="$APP_HOSTING_BACKEND"
+          [ -z "$BACKEND" ] && BACKEND="$FIREBASE_PROJECT_ID"
+          # When environment=dev, target the <app>-dev backend (CONTEXT D-09, D-14, RESEARCH §Pitfall 9).
+          if [ "$ENVIRONMENT" = "dev" ]; then
+            BACKEND="${BACKEND}-dev"
+          fi
+          # Choose deploy branch: env=dev defaults to 'dev' branch; env=prod defaults to 'main'.
+          # Caller-supplied INPUT_GIT_BRANCH overrides — but if INPUT_GIT_BRANCH=='main' AND ENVIRONMENT=='dev',
+          # interpret 'main' as the v3 default and switch to 'dev' (RESEARCH §git_branch for dev — Option 2).
+          DEPLOY_BRANCH="${INPUT_GIT_BRANCH:-main}"
+          if [ "$ENVIRONMENT" = "dev" ] && [ "$DEPLOY_BRANCH" = "main" ]; then
+            DEPLOY_BRANCH="dev"
+          fi
+          echo "Rolling out branch '$DEPLOY_BRANCH' to backend $BACKEND (env=$ENVIRONMENT) in project $FIREBASE_PROJECT_ID"
+          # For prod, use apphosting.prod.yaml overlay (CONTEXT D-16); for dev, use default apphosting.yaml.
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            firebase apphosting:rollouts:create "$BACKEND" \
+              --git-branch "$DEPLOY_BRANCH" \
+              --project "$FIREBASE_PROJECT_ID" \
+              --config apphosting.prod.yaml \
+              --non-interactive 2>&1
+          else
+            firebase apphosting:rollouts:create "$BACKEND" \
+              --git-branch "$DEPLOY_BRANCH" \
+              --project "$FIREBASE_PROJECT_ID" \
+              --non-interactive 2>&1
+          fi
 
       - name: Deploy via App Hosting (branch preview)
         id: deploy_apphosting_branch
