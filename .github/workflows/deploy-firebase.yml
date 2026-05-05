@@ -127,19 +127,14 @@ jobs:
             DEPLOY_BRANCH="dev"
           fi
           echo "Rolling out branch '$DEPLOY_BRANCH' to backend $BACKEND (env=$ENVIRONMENT) in project $FIREBASE_PROJECT_ID"
-          # For prod, use apphosting.prod.yaml overlay (CONTEXT D-16); for dev, use default apphosting.yaml.
-          if [ "$ENVIRONMENT" = "prod" ]; then
-            firebase apphosting:rollouts:create "$BACKEND" \
-              --git-branch "$DEPLOY_BRANCH" \
-              --project "$FIREBASE_PROJECT_ID" \
-              --config apphosting.prod.yaml \
-              --non-interactive 2>&1
-          else
-            firebase apphosting:rollouts:create "$BACKEND" \
-              --git-branch "$DEPLOY_BRANCH" \
-              --project "$FIREBASE_PROJECT_ID" \
-              --non-interactive 2>&1
-          fi
+          # Per-environment yaml selection is handled by Firebase App Hosting at build time:
+          # each backend has an Environment Name setting (Console: Backend → Settings → Environment).
+          # When set, App Hosting auto-loads apphosting.<env_name>.yaml and merges it over apphosting.yaml.
+          # https://firebase.google.com/docs/app-hosting/multiple-environments
+          firebase apphosting:rollouts:create "$BACKEND" \
+            --git-branch "$DEPLOY_BRANCH" \
+            --project "$FIREBASE_PROJECT_ID" \
+            --non-interactive 2>&1
 
       - name: Deploy via App Hosting (branch preview)
         id: deploy_apphosting_branch
