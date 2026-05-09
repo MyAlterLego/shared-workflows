@@ -392,13 +392,21 @@ jobs:
             echo "FAILURE_REASON=missing_credentials" >> $GITHUB_OUTPUT
           fi
 
-      # ── Email fallback when Slack delivery fails ─────────────────────────
+      # ── Email fallback when Slack delivery actually fails ────────────────
       # Sends a plain HTML email to the configured alert recipient via Resend
-      # whenever the Slack step did not deliver (missing creds, API rejection,
-      # or webhook non-200). Skips silently if RESEND_API_KEY is not set so
-      # consumer repos that haven't onboarded Resend keep working unchanged.
+      # ONLY when Slack accepted but rejected (bot_api_rejected:*) or the
+      # webhook returned non-200 (webhook_http_*) — i.e. real delivery failures.
+      #
+      # Explicitly DOES NOT send when FAILURE_REASON == 'missing_credentials'
+      # because that's a configuration gap (no slack creds in CRDB or repo
+      # secrets), not a delivery failure. Sending email every deploy in that
+      # case spams the alert inbox until the config is fixed; consumers can
+      # tell from CI logs that Slack creds are missing.
+      #
+      # Skips silently if RESEND_API_KEY is not set so consumer repos that
+      # haven't onboarded Resend keep working unchanged.
       - name: Send email on Slack failure
-        if: steps.slack-send.outputs.DELIVERY == 'failed'
+        if: steps.slack-send.outputs.DELIVERY == 'failed' && steps.slack-send.outputs.FAILURE_REASON != 'missing_credentials'
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           ALERT_FROM_EMAIL: ${{ inputs.alert_from_email }}
