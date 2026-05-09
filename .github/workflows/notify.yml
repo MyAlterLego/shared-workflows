@@ -50,6 +50,22 @@ on:
       alert_to_email:
         type: string
         default: 'support@triarchsecurity.com'
+    # ── Declared secrets (v1.6+) ────────────────────────────────────────────
+    # Both are optional. When a consumer repo calls this workflow with
+    # `secrets: inherit` and the org has SLACK_BOT_TOKEN + SLACK_CHANNEL_ID
+    # configured, the resolve step will use them DIRECTLY without touching
+    # CRDB. This is the preferred path — fast, reliable, no DB dependency.
+    #
+    # When these secrets are absent, the resolve step falls back to the
+    # legacy CRDB lookup (DATABASE_URL → settings table) for backwards
+    # compatibility with repos/orgs that haven't set the org secrets yet.
+    secrets:
+      SLACK_BOT_TOKEN:
+        required: false
+        description: 'Slack Bot User OAuth token (xoxb-...). When set, used directly without CRDB query.'
+      SLACK_CHANNEL_ID:
+        required: false
+        description: 'Slack channel ID for the deploy notification. When set, used directly without CRDB query.'
 
 jobs:
   notify:
@@ -191,35 +207,56 @@ jobs:
           echo "STATUS=$FINAL" >> $GITHUB_OUTPUT
           echo "Final status: $FINAL (input=$INPUT_STATUS, fah=$FAH_STATE)"
 
-      - name: Fetch Slack credentials from CRDB
+      # ── Resolve Slack credentials ────────────────────────────────────────
+      # Precedence (v1.6+):
+      #   1. Inherited org/repo secrets SLACK_BOT_TOKEN + SLACK_CHANNEL_ID
+      #      (preferred — fast, no DB dependency, works during outages)
+      #   2. CRDB `settings` table via DATABASE_URL (legacy fallback for
+      #      orgs/repos that haven't set the direct secrets yet)
+      #   3. Empty outputs → Slack send step falls back to SLACK_WEBHOOK_URL
+      #      or no-ops with FAILURE_REASON=missing_credentials (which is
+      #      explicitly excluded from email-spam by the v1.5 fix below).
+      - name: Resolve Slack credentials
         id: slack-creds
         env:
+          INPUT_SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          INPUT_SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          if [ -z "$DATABASE_URL" ]; then
-            echo "::warning::DATABASE_URL not set — cannot fetch Slack credentials from CRDB"
-            echo "BOT_TOKEN=" >> $GITHUB_OUTPUT
-            echo "CHANNEL_ID=" >> $GITHUB_OUTPUT
+          # ── Path 1: Direct inherited secrets (preferred) ──
+          if [ -n "$INPUT_SLACK_BOT_TOKEN" ] && [ -n "$INPUT_SLACK_CHANNEL_ID" ]; then
+            echo "::add-mask::$INPUT_SLACK_BOT_TOKEN"
+            echo "BOT_TOKEN=$INPUT_SLACK_BOT_TOKEN" >> $GITHUB_OUTPUT
+            echo "CHANNEL_ID=$INPUT_SLACK_CHANNEL_ID" >> $GITHUB_OUTPUT
+            echo "Slack credentials sourced from inherited secrets (direct path)"
             exit 0
           fi
 
-          # Query settings table for slack credentials
-          BOT_TOKEN=$(psql "$DATABASE_URL" -t -A -c "SELECT value FROM settings WHERE key = 'slack_bot_token'" 2>/dev/null || echo "")
-          CHANNEL_ID=$(psql "$DATABASE_URL" -t -A -c "SELECT value FROM settings WHERE key = 'slack_channel_id'" 2>/dev/null || echo "")
+          # ── Path 2: CRDB fallback (legacy) ──
+          if [ -n "$DATABASE_URL" ]; then
+            BOT_TOKEN=$(psql "$DATABASE_URL" -t -A -c "SELECT value FROM settings WHERE key = 'slack_bot_token'" 2>/dev/null || echo "")
+            CHANNEL_ID=$(psql "$DATABASE_URL" -t -A -c "SELECT value FROM settings WHERE key = 'slack_channel_id'" 2>/dev/null || echo "")
 
-          # Mask the bot token so it doesn't appear in logs
-          if [ -n "$BOT_TOKEN" ]; then
-            echo "::add-mask::$BOT_TOKEN"
+            # Mask the bot token so it doesn't appear in logs
+            if [ -n "$BOT_TOKEN" ]; then
+              echo "::add-mask::$BOT_TOKEN"
+            fi
+
+            echo "BOT_TOKEN=$BOT_TOKEN" >> $GITHUB_OUTPUT
+            echo "CHANNEL_ID=$CHANNEL_ID" >> $GITHUB_OUTPUT
+
+            if [ -n "$BOT_TOKEN" ] && [ -n "$CHANNEL_ID" ]; then
+              echo "Slack credentials loaded from CRDB (legacy path)"
+            else
+              echo "Slack credentials not found in CRDB — will fall back to webhook"
+            fi
+            exit 0
           fi
 
-          echo "BOT_TOKEN=$BOT_TOKEN" >> $GITHUB_OUTPUT
-          echo "CHANNEL_ID=$CHANNEL_ID" >> $GITHUB_OUTPUT
-
-          if [ -n "$BOT_TOKEN" ] && [ -n "$CHANNEL_ID" ]; then
-            echo "Slack Bot credentials loaded from CRDB"
-          else
-            echo "Slack Bot credentials not found in CRDB — will fall back to webhook"
-          fi
+          # ── Path 3: No credentials available ──
+          echo "::warning::Neither inherited Slack secrets nor DATABASE_URL set — Slack send will rely on SLACK_WEBHOOK_URL or no-op"
+          echo "BOT_TOKEN=" >> $GITHUB_OUTPUT
+          echo "CHANNEL_ID=" >> $GITHUB_OUTPUT
 
       - name: Send Slack notification
         id: slack-send
