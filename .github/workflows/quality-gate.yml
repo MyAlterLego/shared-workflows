@@ -171,7 +171,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
+      # NOTE: `pull-requests: write` removed — Dependabot's push-event token
+      # is read-only on private repos and rejects this permission, causing
+      # startup_failure (`jobs: []`). Scanner output goes to workflow logs
+      # only; if you want PR comments, post-process the JSON in a separate
+      # step that runs only on push events (where `pull-requests: write`
+      # actually works), not on pull_request from Dependabot.
     container:
       image: semgrep/semgrep:latest
     steps:
