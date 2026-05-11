@@ -191,7 +191,11 @@ jobs:
     needs: rebase
     outputs:
       run_url: ${{ steps.run_url.outputs.url }}
-    # Mirror quality-gate.yml's env block — secrets passed via workflow_call secrets: block above.
+    # v6: NODE_AUTH_TOKEN moved to step-level (sourced from App installation
+    # token). GH_PAT retained at job-level for the checkout token — the rebase/
+    # merge jobs still need git push past branch protection, which the App
+    # would only provide if it had Contents:write (currently Contents:read).
+    # Migrating those to App requires a separate decision about App permissions.
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
@@ -199,8 +203,6 @@ jobs:
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GH_PAT: ${{ secrets.GH_PAT || github.token }}
-      NODE_AUTH_TOKEN: ${{ secrets.GH_PAT || github.token }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
       WEBSITE_GITHUB_REPO: ${{ secrets.WEBSITE_GITHUB_REPO }}
@@ -213,6 +215,14 @@ jobs:
           ref: ${{ inputs.branch }}
           token: ${{ secrets.GH_PAT || github.token }}
 
+      - name: Get GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: triarchsecurity
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -221,9 +231,13 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
+        env:
+          NODE_AUTH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: npm ci
 
       - name: Build
+        env:
+          NODE_AUTH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: npm run build
 
       - name: Run tests
