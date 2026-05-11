@@ -185,8 +185,14 @@ jobs:
           fetch-depth: 0
 
       - name: Semgrep diff scan (PR) / full scan (push)
+        # SECURITY: github.base_ref must come via env: + quoted shell var, not direct
+        # ${{ }} interpolation. Direct interpolation is shell-injection-vulnerable per
+        # Semgrep rule yaml.github-actions.security.run-shell-injection.
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_BASE_REF: ${{ github.base_ref }}
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "$GH_EVENT_NAME" == "pull_request" ]]; then
             semgrep ci \
               --config p/ci \
               --config p/owasp-top-ten \
@@ -195,7 +201,7 @@ jobs:
               --config p/javascript \
               --config p/nodejs \
               --config p/secrets \
-              --baseline-ref origin/${{ github.base_ref }} \
+              --baseline-ref "origin/$GH_BASE_REF" \
               --json --output=semgrep.json || true
           else
             semgrep ci \
@@ -265,13 +271,18 @@ jobs:
           sudo mv /tmp/gitleaks /usr/local/bin/
 
       - name: Run gitleaks (PR diff or full repo scan)
+        # SECURITY: github.base_ref + event_name via env: + quoted shell vars
+        # (avoids run-shell-injection per Semgrep rule).
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_BASE_REF: ${{ github.base_ref }}
         run: |
           set +e
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "$GH_EVENT_NAME" == "pull_request" ]]; then
             CONFIG_ARG=""
             [ -f .gitleaks.toml ] && CONFIG_ARG="--config=.gitleaks.toml"
             gitleaks protect --source=. --redact $CONFIG_ARG \
-              --log-opts="--no-merges origin/${{ github.base_ref }}..HEAD"
+              --log-opts="--no-merges origin/$GH_BASE_REF..HEAD"
           else
             CONFIG_ARG=""
             [ -f .gitleaks.toml ] && CONFIG_ARG="--config=.gitleaks.toml"
