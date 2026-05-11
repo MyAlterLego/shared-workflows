@@ -33,6 +33,10 @@ on:
       needs_build:
         type: boolean
         default: true
+      run_security_scans:
+        type: boolean
+        default: true
+        description: 'Run Semgrep + OSV-Scanner + Gitleaks (in parallel with the gate job)'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -148,3 +152,129 @@ jobs:
           path: |
             tests/**/*.md
           retention-days: 30
+
+  # ---------------------------------------------------------------- security scanning (added v1.7)
+  # Runs in parallel with `gate` for speed. Findings appear in the workflow log.
+  # No SARIF upload (would require GHAS / Code Security, which org Free + Team
+  # don't include for private repos). When the org acquires Code Security, add
+  # `security-events: write` to each job's permissions and append an
+  # `actions/upload-sarif` step with `continue-on-error: true` removed.
+  #
+  # These three jobs are the framework's REQUIRED status-check trio. Once your
+  # repo's main branch has run them at least once, upgrade the repo's ruleset
+  # from `main-protection-baseline.json` to `main-protection-lite.json` (which
+  # adds these as required_status_checks).
+
+  semgrep:
+    name: semgrep
+    if: inputs.run_security_scans
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Semgrep diff scan (PR) / full scan (push)
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            semgrep ci \
+              --config p/ci \
+              --config p/owasp-top-ten \
+              --config p/react \
+              --config p/typescript \
+              --config p/javascript \
+              --config p/nodejs \
+              --config p/secrets \
+              --baseline-ref origin/${{ github.base_ref }} \
+              --json --output=semgrep.json || true
+          else
+            semgrep ci \
+              --config p/ci \
+              --config p/owasp-top-ten \
+              --json --output=semgrep.json || true
+          fi
+
+      - name: Fail on Critical / High
+        run: |
+          if [[ -f semgrep.json ]]; then
+            high=$(jq '[.results[] | select(.extra.severity=="ERROR" or .extra.severity=="WARNING")] | length' semgrep.json)
+            if [[ "$high" -gt 0 ]]; then
+              echo "::error::Semgrep found $high Critical/High findings"
+              jq '.results[] | select(.extra.severity=="ERROR" or .extra.severity=="WARNING") | {check_id, path, message: .extra.message}' semgrep.json
+              exit 1
+            fi
+            echo "no Critical/High findings"
+          fi
+
+  osv-scanner:
+    name: osv-scanner
+    if: inputs.run_security_scans
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run OSV-Scanner
+        # google/osv-scanner-action is a monorepo; sub-action lives in /osv-scanner-action.
+        # v2 dropped --skip-git (now default behavior).
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.5   # TODO: pin to commit SHA
+        with:
+          scan-args: |-
+            --recursive
+            --format=json
+            --output=osv.json
+            ./
+        continue-on-error: true   # known vulns surface but don't block PRs; Dependabot is the remediation channel
+
+      - name: Summarize OSV findings
+        if: always()
+        run: |
+          if [[ -f osv.json ]]; then
+            count=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' osv.json 2>/dev/null || echo 0)
+            echo "OSV-Scanner found $count vulnerable package versions (see Dependabot for remediation)"
+            jq -r '.results[]?.packages[]? | "  \(.package.name)@\(.package.version): \([.vulnerabilities[].id] | join(\",\"))"' osv.json 2>/dev/null | head -30 || true
+          fi
+
+  gitleaks:
+    name: gitleaks
+    if: inputs.run_security_scans
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (binary, not Action — Action requires paid org license)
+        run: |
+          GITLEAKS_VERSION="8.30.1"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp
+          sudo mv /tmp/gitleaks /usr/local/bin/
+
+      - name: Run gitleaks (PR diff or full repo scan)
+        run: |
+          set +e
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            CONFIG_ARG=""
+            [ -f .gitleaks.toml ] && CONFIG_ARG="--config=.gitleaks.toml"
+            gitleaks protect --source=. --redact $CONFIG_ARG \
+              --log-opts="--no-merges origin/${{ github.base_ref }}..HEAD"
+          else
+            CONFIG_ARG=""
+            [ -f .gitleaks.toml ] && CONFIG_ARG="--config=.gitleaks.toml"
+            gitleaks detect --source=. --redact $CONFIG_ARG
+          fi
+          rc=$?
+          if [[ $rc -eq 1 ]]; then
+            echo "::error::gitleaks found one or more secrets"
+            exit 1
+          fi
+          echo "no secrets found"
