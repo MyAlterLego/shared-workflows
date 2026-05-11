@@ -55,12 +55,12 @@ jobs:
     # Any secret set on the calling repo (or inherited from the org) is
     # available here. Empty/missing secrets evaluate to empty string (safe).
     #
-    # v6: GitHub App-based auth for GitHub Packages.
-    # NODE_AUTH_TOKEN is now minted per-run from CI_APP_ID + CI_APP_PRIVATE_KEY
-    # (triarchsecurity-ci App, org secrets, visibility=all) instead of a
-    # long-lived GH_PAT. See the "Get GitHub App installation token" step below.
-    # The token is set at step-level (not job-level) so it can reference
-    # step outputs.
+    # v7: NODE_AUTH_TOKEN uses secrets.GITHUB_TOKEN (per-run auto-minted
+    # repo token). The consumer repo must be added to the npm package's
+    # "Manage Actions access" list for this to work. v6's GitHub App token
+    # path was abandoned — GitHub Packages npm registry has a legacy access
+    # check that doesn't honor cross-repo App installation tokens despite
+    # the App being installed on the source repo. Use GITHUB_TOKEN instead.
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
@@ -80,14 +80,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Get GitHub App installation token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
-          owner: triarchsecurity
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -96,7 +88,7 @@ jobs:
 
       - name: Install dependencies
         env:
-          NODE_AUTH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm ci
 
       - name: Build application
