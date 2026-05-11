@@ -310,7 +310,27 @@ jobs:
             COLOR="#95a5a6"
           fi
 
-          # Build version line
+          # Build version line — auto-extract from package.json or version.ts/js if not passed,
+          # so callers that don't have a `deploy` job (FAH connected-repo pattern) still get
+          # a Version field in the rich Slack format.
+          if [ -z "$INPUT_VERSION" ] || [ "$INPUT_VERSION" = "unknown" ]; then
+            # Need to fetch the file from the repo at the deployed SHA. Use GitHub raw API.
+            VER=""
+            for path in src/lib/version.ts public/js/version.js package.json; do
+              CONTENT=$(curl -sf -H "Authorization: Bearer ${{ github.token }}" \
+                "https://api.github.com/repos/${{ github.repository }}/contents/${path}?ref=${GH_SHA}" \
+                2>/dev/null | grep -oP '"content"\s*:\s*"\K[^"]+' | tr -d '\n' | base64 -d 2>/dev/null)
+              [ -z "$CONTENT" ] && continue
+              if [[ "$path" == "package.json" ]]; then
+                VER=$(echo "$CONTENT" | grep -oP '"version"\s*:\s*"\K[^"]+' | head -1)
+              else
+                VER=$(echo "$CONTENT" | grep -oP "APP_VERSION\s*=\s*'\K[^']+" | head -1)
+              fi
+              [ -n "$VER" ] && break
+            done
+            INPUT_VERSION="${VER:-unknown}"
+            echo "Auto-extracted version: $INPUT_VERSION (caller did not pass version)"
+          fi
           VERSION_LINE=""
           if [ -n "$INPUT_VERSION" ] && [ "$INPUT_VERSION" != "unknown" ]; then
             VERSION_LINE="\`${INPUT_VERSION}\`"
@@ -391,27 +411,40 @@ jobs:
               echo "FAILURE_REASON=bot_api_rejected:$SLACK_ERR" >> $GITHUB_OUTPUT
             fi
           elif [ -n "$SLACK_WEBHOOK_URL" ]; then
-            # ── Fallback: Slack Incoming Webhook (no threading) ──
-            TEXT="${EMOJI} *${INPUT_PROJECT_NAME}* ${STATUS_TEXT}"
-
+            # ── Fallback: Slack Incoming Webhook (no threading, but still RICH BLOCKS) ──
+            # Uses the same blocks payload as the BOT_TOKEN path so the Slack
+            # message format is consistent regardless of credential path.
+            # Loses only: threading + thread_ts replies (webhook has no message-id).
+            FIELDS='['
             if [ -n "$VERSION_LINE" ]; then
-              TEXT="${TEXT}  |  ${VERSION_LINE}"
+              FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Version*\n${VERSION_LINE}\"},"
             fi
+            FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Branch*\n\`${GH_REF_NAME}\`\"},"
+            FIELDS="${FIELDS}{\"type\":\"mrkdwn\",\"text\":\"*Commit*\n<${GH_COMMIT_URL}|${GH_SHA:0:7}>\"}"
+            FIELDS="${FIELDS}]"
+
+            BLOCKS='[
+              {"type":"section","text":{"type":"mrkdwn","text":"'"${EMOJI} *${INPUT_PROJECT_NAME}* ${STATUS_TEXT}"'"}},
+              {"type":"section","fields":'"${FIELDS}"'}'
 
             if [ -n "$COMMIT_LINE" ]; then
-              TEXT="${TEXT}\n> ${COMMIT_LINE}"
+              COMMIT_ESCAPED=$(echo "$COMMIT_LINE" | sed 's/"/\\"/g' | sed "s/'/\\\\'/g")
+              BLOCKS="${BLOCKS},"'{"type":"context","elements":[{"type":"mrkdwn","text":"'"${COMMIT_ESCAPED}"'"}]}'
             fi
 
-            TEXT="${TEXT}\nBranch: \`${GH_REF_NAME}\`  |  <${GH_RUN_URL}|View run>"
-
+            ACTIONS='{"type":"actions","elements":['
+            ACTIONS_ITEMS=""
             if [ -n "${INPUT_APP_URL}" ]; then
-              TEXT="${TEXT}  |  <${INPUT_APP_URL}|View site>"
+              ACTIONS_ITEMS='{"type":"button","text":{"type":"plain_text","text":"View Site"},"url":"'"${INPUT_APP_URL}"'"}'
             fi
+            ACTIONS_ITEMS="${ACTIONS_ITEMS:+${ACTIONS_ITEMS},}"'{"type":"button","text":{"type":"plain_text","text":"View Run"},"url":"'"${GH_RUN_URL}"'"}'
+            ACTIONS="${ACTIONS}${ACTIONS_ITEMS}]}"
+            BLOCKS="${BLOCKS},${ACTIONS}]"
 
             HTTP_CODE=$(curl -sS --max-time 10 -o /dev/null -w "%{http_code}" \
               -X POST "$SLACK_WEBHOOK_URL" \
               -H "Content-Type: application/json" \
-              -d "{\"text\":\"$(echo "$TEXT" | sed 's/"/\\"/g')\"}" 2>/dev/null || echo "000")
+              -d "{\"blocks\":${BLOCKS},\"text\":\"${EMOJI} ${INPUT_PROJECT_NAME} ${STATUS_TEXT}\"}" 2>/dev/null || echo "000")
 
             if [ "$HTTP_CODE" = "200" ]; then
               echo "Sent via Incoming Webhook (add slack_bot_token + slack_channel_id to CRDB settings for rich notifications with threading)"
