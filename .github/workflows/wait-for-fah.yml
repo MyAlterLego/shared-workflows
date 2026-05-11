@@ -1,0 +1,160 @@
+name: Wait for Firebase App Hosting Rollout
+
+# Polls Firebase App Hosting for the most recent rollout on the given backend
+# until it reaches a terminal state (SUCCEEDED / FAILED / CANCELLED) or the
+# timeout elapses.
+#
+# Use this as a `deploy:` job in a caller's ci-cd.yml when the actual deploy
+# is performed by FAH's connected-repo auto-deploy (Pattern A) and you want
+# the deploy step to be visible in the GitHub Actions pipeline graph.
+# This is OBSERVABILITY only — it doesn't run `firebase deploy`. FAH does.
+#
+# For repos that explicitly run `firebase deploy --only apphosting` from a
+# job (Pattern B), you don't need this — the deploy job IS the deploy.
+#
+# Caller pattern:
+#   jobs:
+#     quality-gate: { uses: shared-workflows/quality-gate.yml@v1, ... }
+#     deploy:
+#       needs: quality-gate
+#       if: github.event_name == 'push'
+#       uses: triarchsecurity/shared-workflows/.github/workflows/wait-for-fah.yml@v1
+#       with:
+#         firebase_project_id: <gcp-project-id>
+#         app_hosting_backend: <fah-backend-name>
+#       secrets: inherit
+#     notify:
+#       needs: [quality-gate, deploy]
+#       if: always() && github.event_name == 'push'
+#       uses: triarchsecurity/shared-workflows/.github/workflows/notify.yml@v1
+#       with:
+#         status: ${{ needs.deploy.result }}
+#         ...
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      firebase_project_id:
+        required: true
+        type: string
+        description: 'GCP project ID (e.g. triarch-dev-tmi)'
+      app_hosting_backend:
+        required: true
+        type: string
+        description: 'FAH backend name (e.g. tmi)'
+      timeout_seconds:
+        type: number
+        default: 600
+        description: 'Max time to wait for FAH rollout to reach terminal state'
+      poll_interval_seconds:
+        type: number
+        default: 15
+        description: 'How often to poll FAH for rollout state'
+    secrets:
+      FIREBASE_SA_KEY:
+        required: true
+        description: 'GCP service-account JSON for Firebase auth'
+    outputs:
+      rollout_status:
+        description: 'Final FAH rollout state: success / failure / cancelled / timeout / unknown'
+        value: ${{ jobs.wait.outputs.status }}
+      rollout_duration_seconds:
+        description: 'Wall-clock seconds spent polling (≈ FAH rollout duration when success)'
+        value: ${{ jobs.wait.outputs.duration }}
+
+permissions:
+  contents: read
+
+jobs:
+  wait:
+    name: Wait for FAH Rollout
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      status: ${{ steps.poll.outputs.STATUS }}
+      duration: ${{ steps.poll.outputs.DURATION }}
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+
+      - name: Poll Firebase App Hosting for rollout completion
+        id: poll
+        env:
+          FIREBASE_PROJECT_ID: ${{ inputs.firebase_project_id }}
+          FAH_BACKEND: ${{ inputs.app_hosting_backend }}
+          TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          POLL_INTERVAL: ${{ inputs.poll_interval_seconds }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          START=$(date +%s)
+          DEADLINE=$((START + TIMEOUT_SECONDS))
+
+          echo "Watching FAH backend '${FAH_BACKEND}' on project '${FIREBASE_PROJECT_ID}'"
+          echo "Looking for rollout matching commit ${GH_SHA:0:8}"
+          echo "Timeout: ${TIMEOUT_SECONDS}s; poll interval: ${POLL_INTERVAL}s"
+          echo ""
+
+          STATUS="unknown"
+          while true; do
+            # Fetch most recent rollout. firebase apphosting:rollouts:list returns JSON array
+            # ordered most-recent-first. Tolerate empty/transient errors with `|| true`.
+            ROLLOUTS=$(firebase apphosting:rollouts:list \
+              --project="$FIREBASE_PROJECT_ID" \
+              --backend="$FAH_BACKEND" \
+              --json 2>/dev/null || echo "[]")
+
+            # Some firebase CLI versions return a wrapper {result:[...]}; normalize.
+            FIRST=$(echo "$ROLLOUTS" | jq -r 'if type=="array" then .[0] else (.result // [])[0] // empty end' 2>/dev/null)
+            STATE=$(echo "$FIRST" | jq -r '.state // "UNKNOWN"' 2>/dev/null)
+
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START))
+            echo "[t+${ELAPSED}s] FAH rollout state: ${STATE}"
+
+            case "$STATE" in
+              READY|SUCCEEDED)
+                STATUS="success"
+                break ;;
+              FAILED)
+                STATUS="failure"
+                break ;;
+              CANCELLED)
+                STATUS="cancelled"
+                break ;;
+              # PENDING, BUILDING, DEPLOYING, etc. — keep polling
+              *) ;;
+            esac
+
+            if [ "$NOW" -ge "$DEADLINE" ]; then
+              STATUS="timeout"
+              echo "::warning::FAH polling timed out after ${TIMEOUT_SECONDS}s; last state=${STATE}"
+              break
+            fi
+
+            sleep "$POLL_INTERVAL"
+          done
+
+          DURATION=$((NOW - START))
+          echo ""
+          echo "Final FAH rollout status: ${STATUS} (after ${DURATION}s)"
+
+          echo "STATUS=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "DURATION=${DURATION}" >> "$GITHUB_OUTPUT"
+
+          # Fail the job on non-success terminal states so the pipeline graph turns red.
+          # `notify` job downstream uses `if: always()` so it still fires.
+          case "$STATUS" in
+            success) exit 0 ;;
+            *)       exit 1 ;;
+          esac
