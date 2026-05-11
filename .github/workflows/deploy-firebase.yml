@@ -10,13 +10,19 @@ on:
         type: string
         default: 'apphosting'
       app_hosting_backend:
+        description: 'Prod FAH backend name. Used when environment=prod, or when environment=dev and dev_backend is empty (legacy auto-suffix path appends "-dev").'
+        type: string
+        default: ''
+      dev_backend:
+        description: 'Explicit dev FAH backend name. Used when environment=dev. Overrides the legacy "<app_hosting_backend>-dev" auto-suffix. Required for projects where prod and dev backend names are not the standard <name>/<name>-dev pair (e.g. admin: triarch-dev/admin-dev, darksouls: darksouls-rpg/darksouls-dev).'
+        required: false
         type: string
         default: ''
       app_url:
         type: string
         default: ''
       git_branch:
-        description: 'Git branch to deploy. Empty or "main" deploys main as today. Non-main triggers FAH branch rollout to the same backend URL.'
+        description: 'Git branch to deploy. Empty or "main" with environment=prod deploys main. Empty or "main" with environment=dev deploys the "dev" branch. Pass a non-default value to override.'
         required: false
         type: string
         default: 'main'
@@ -111,17 +117,29 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           FIREBASE_PROJECT_ID: ${{ inputs.firebase_project_id }}
           APP_HOSTING_BACKEND: ${{ inputs.app_hosting_backend }}
+          DEV_BACKEND: ${{ inputs.dev_backend }}
           INPUT_GIT_BRANCH: ${{ inputs.git_branch }}
         run: |
-          BACKEND="$APP_HOSTING_BACKEND"
-          [ -z "$BACKEND" ] && BACKEND="$FIREBASE_PROJECT_ID"
-          # When environment=dev, target the <app>-dev backend (CONTEXT D-09, D-14, RESEARCH §Pitfall 9).
+          # v5: resolve backend with explicit dev_backend support (no more "-dev" auto-suffix
+          # when the caller has supplied an explicit dev backend name).
           if [ "$ENVIRONMENT" = "dev" ]; then
-            BACKEND="${BACKEND}-dev"
+            if [ -n "$DEV_BACKEND" ]; then
+              # Explicit dev_backend wins. Used for projects where prod backend isn't <name> and
+              # dev isn't <name>-dev (e.g. admin: prod=triarch-dev, dev=admin-dev).
+              BACKEND="$DEV_BACKEND"
+            elif [ -n "$APP_HOSTING_BACKEND" ]; then
+              # Legacy v4 behavior: auto-suffix "-dev" onto the prod backend.
+              BACKEND="${APP_HOSTING_BACKEND}-dev"
+            else
+              BACKEND="${FIREBASE_PROJECT_ID}-dev"
+            fi
+          else
+            BACKEND="$APP_HOSTING_BACKEND"
+            [ -z "$BACKEND" ] && BACKEND="$FIREBASE_PROJECT_ID"
           fi
           # Choose deploy branch: env=dev defaults to 'dev' branch; env=prod defaults to 'main'.
           # Caller-supplied INPUT_GIT_BRANCH overrides — but if INPUT_GIT_BRANCH=='main' AND ENVIRONMENT=='dev',
-          # interpret 'main' as the v3 default and switch to 'dev' (RESEARCH §git_branch for dev — Option 2).
+          # interpret 'main' as the default and switch to 'dev' (RESEARCH §git_branch for dev — Option 2).
           DEPLOY_BRANCH="${INPUT_GIT_BRANCH:-main}"
           if [ "$ENVIRONMENT" = "dev" ] && [ "$DEPLOY_BRANCH" = "main" ]; then
             DEPLOY_BRANCH="dev"
