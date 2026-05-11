@@ -191,11 +191,12 @@ jobs:
     needs: rebase
     outputs:
       run_url: ${{ steps.run_url.outputs.url }}
-    # v6: NODE_AUTH_TOKEN moved to step-level (sourced from App installation
-    # token). GH_PAT retained at job-level for the checkout token — the rebase/
-    # merge jobs still need git push past branch protection, which the App
-    # would only provide if it had Contents:write (currently Contents:read).
-    # Migrating those to App requires a separate decision about App permissions.
+    # v7: NODE_AUTH_TOKEN uses secrets.GITHUB_TOKEN at step level for npm
+    # install + build. GH_PAT retained at job-level for the rebase/merge
+    # checkout tokens — those need Contents:write to push past branch
+    # protection, which GITHUB_TOKEN does not provide. App-token approach
+    # abandoned because GitHub Packages npm registry doesn't honor cross-
+    # repo App installation tokens.
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
@@ -215,14 +216,6 @@ jobs:
           ref: ${{ inputs.branch }}
           token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Get GitHub App installation token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
-          owner: triarchsecurity
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -232,12 +225,12 @@ jobs:
 
       - name: Install dependencies
         env:
-          NODE_AUTH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm ci
 
       - name: Build
         env:
-          NODE_AUTH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run build
 
       - name: Run tests

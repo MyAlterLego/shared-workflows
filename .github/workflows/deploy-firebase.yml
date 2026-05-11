@@ -61,22 +61,14 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.APP_VERSION }}
 
-    # v6: NODE_AUTH_TOKEN comes from the GitHub App installation token
-    # minted in the "Get GitHub App installation token" step below — set
-    # at step-level (not here at job-level), since job-level env can't
-    # reference step outputs.
+    # v7: NODE_AUTH_TOKEN uses secrets.GITHUB_TOKEN at step-level on
+    # "Install project dependencies". Consumer repo must be in the npm
+    # package's "Manage Actions access" list. See header comment of
+    # quality-gate.yml for the v6→v7 pivot rationale.
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Get GitHub App installation token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
-          owner: triarchsecurity
 
       - name: Extract version
         id: version
@@ -113,7 +105,7 @@ jobs:
 
       - name: Install project dependencies
         env:
-          NODE_AUTH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm ci || npm install
 
       - name: Install Firebase CLI
