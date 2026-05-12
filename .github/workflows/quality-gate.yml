@@ -37,6 +37,10 @@ on:
         type: boolean
         default: true
         description: 'Run Semgrep + OSV-Scanner + Gitleaks (in parallel with the gate job)'
+      run_gitleaks:
+        type: boolean
+        default: true
+        description: 'Run gitleaks specifically. When false, gitleaks is skipped even if run_security_scans is true. Use to bypass on repos with pre-existing leaks in history that are being cleaned up in a separate effort.'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -254,7 +258,7 @@ jobs:
 
   gitleaks:
     name: gitleaks
-    if: inputs.run_security_scans
+    if: inputs.run_security_scans && inputs.run_gitleaks
     runs-on: ubuntu-latest
     permissions:
       contents: read
