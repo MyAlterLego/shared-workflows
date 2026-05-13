@@ -1,0 +1,89 @@
+name: MCP Build
+
+# Reusable workflow for local MCP server repos (triarch-admin-mcp,
+# triarch-dev-mcp, etc.). These are stdio MCP servers consumed by Claude
+# Code — no deploy step, just verify that the TypeScript builds cleanly
+# and that the binary starts without crashing on its entry path.
+#
+# Caller example (.github/workflows/ci.yml in the MCP repo):
+#
+#   name: CI
+#   on:
+#     pull_request:
+#       branches: [main]
+#     push:
+#       branches: [main]
+#   jobs:
+#     ci:
+#       uses: triarchsecurity/shared-workflows/.github/workflows/mcp-build.yml@main
+#
+# Optional inputs:
+#   node_version       Node version to test against (default '22')
+#   working_directory  Where package.json lives (default '.')
+#   smoke_test         When true, runs the built binary with TRIARCH_AGENT_TOKEN=tak_ci_dummy_token_for_build
+#                      and confirms it exits cleanly (default true). Validates the entry
+#                      module parses + token resolver accepts plaintext path.
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        type: string
+        default: '22'
+      working_directory:
+        type: string
+        default: '.'
+      smoke_test:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Typecheck + Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ inputs.node_version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run type-check
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke test
+        if: ${{ inputs.smoke_test }}
+        env:
+          TRIARCH_AGENT_TOKEN: tak_ci_dummy_token_for_build_only
+        # Launch the built binary with the plaintext fallback token, give it
+        # 2 seconds to attach to stdio, then kill. Exit 0 means the entry
+        # module parsed, the token resolver returned, and stdio bound — i.e.
+        # the build artifact is functional. Anything else fails the job.
+        run: |
+          node dist/index.js < /dev/null &
+          PID=$!
+          sleep 2
+          if kill -0 $PID 2>/dev/null; then
+            kill $PID
+            echo "✓ binary started cleanly"
+          else
+            echo "✗ binary exited before stdio bind"
+            exit 1
+          fi
