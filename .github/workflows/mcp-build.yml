@@ -72,18 +72,19 @@ jobs:
         if: ${{ inputs.smoke_test }}
         env:
           TRIARCH_AGENT_TOKEN: tak_ci_dummy_token_for_build_only
-        # Launch the built binary with the plaintext fallback token, give it
-        # 2 seconds to attach to stdio, then kill. Exit 0 means the entry
-        # module parsed, the token resolver returned, and stdio bound — i.e.
-        # the build artifact is functional. Anything else fails the job.
+        # Launch the built binary with the plaintext fallback token and
+        # capture its startup output. Exit 0 means the entry module parsed,
+        # the token resolver returned, and the stdio transport announced
+        # itself with "connected; serving on stdio". The binary exits
+        # gracefully right after that because stdin is /dev/null (EOF),
+        # which is correct MCP behavior — we don't gate on the process
+        # staying alive, we gate on the announce line appearing.
         run: |
-          node dist/index.js < /dev/null &
-          PID=$!
-          sleep 2
-          if kill -0 $PID 2>/dev/null; then
-            kill $PID
-            echo "✓ binary started cleanly"
+          output=$(node dist/index.js < /dev/null 2>&1 || true)
+          echo "$output"
+          if echo "$output" | grep -q "connected; serving on stdio"; then
+            echo "✓ binary connected and bound stdio"
           else
-            echo "✗ binary exited before stdio bind"
+            echo "✗ binary did not announce stdio bind"
             exit 1
           fi
