@@ -191,17 +191,18 @@ jobs:
           echo "| Version | ${{ steps.version.outputs.APP_VERSION }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
 
-      - name: Notify admin (dev deploy)
-        id: notify_admin_dev
+      - name: Notify admin (release record)
+        id: notify_admin
         continue-on-error: true
         env:
           ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
           ADMIN_CALLBACK_URL: ${{ inputs.admin_callback_url }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           # Pitfall 2: Empty-token guard. GitHub Actions silently substitutes "" for missing secrets.
           if [ -z "$ADMIN_API_TOKEN" ]; then
             echo "::warning::ADMIN_API_TOKEN not set on consumer repo — admin callback skipped. Set this Actions secret to projects.apiKey for this project to enable release tracking."
-            echo "## Admin Callback (dev)" >> $GITHUB_STEP_SUMMARY
+            echo "## Admin Callback (${ENVIRONMENT})" >> $GITHUB_STEP_SUMMARY
             echo "Skipped: ADMIN_API_TOKEN not set." >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
@@ -220,14 +221,18 @@ jobs:
           fi
 
           # Build payload. previewUrl goes inside metadata JSONB per research §previewUrl Storage Decision (D-13).
+          # v8 (2026-05-14): env now reflects inputs.environment rather than hardcoded "dev".
+          # This fixes the long-standing bug where every deploy — including those targeting prod
+          # Firebase backends — was recorded as env=dev in the tracker, hiding real prod versions.
           DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           if [ -n "$PREVIEW_URL" ]; then
             METADATA_JSON="{\"previewUrl\":\"${PREVIEW_URL}\"}"
           else
             METADATA_JSON="{}"
           fi
-          PAYLOAD=$(printf '{"version":"%s","releaseType":"patch","env":"dev","commitSha":"%s","deployedAt":"%s","releasedBy":"%s","branch":"%s","metadata":%s}' \
+          PAYLOAD=$(printf '{"version":"%s","releaseType":"patch","env":"%s","commitSha":"%s","deployedAt":"%s","releasedBy":"%s","branch":"%s","metadata":%s}' \
             "${{ steps.version.outputs.APP_VERSION }}" \
+            "$ENVIRONMENT" \
             "${{ github.sha }}" \
             "$DEPLOYED_AT" \
             "${{ github.actor }}" \
@@ -243,18 +248,19 @@ jobs:
             -d "$PAYLOAD" || echo "000")
 
           if [ "$HTTP_CODE" = "201" ]; then
-            echo "Admin dev callback succeeded (HTTP 201). release_logs row created for ${BRANCH} v${{ steps.version.outputs.APP_VERSION }}."
+            echo "Admin ${ENVIRONMENT} callback succeeded (HTTP 201). release_logs row created for ${BRANCH} v${{ steps.version.outputs.APP_VERSION }}."
           else
             RESP_TEXT=$(head -c 500 "$RESP_BODY")
-            echo "::warning::Admin dev callback failed (HTTP $HTTP_CODE) for ${BRANCH} v${{ steps.version.outputs.APP_VERSION }}. Response body: ${RESP_TEXT}"
+            echo "::warning::Admin ${ENVIRONMENT} callback failed (HTTP $HTTP_CODE) for ${BRANCH} v${{ steps.version.outputs.APP_VERSION }}. Response body: ${RESP_TEXT}"
           fi
           rm -f "$RESP_BODY"
 
-          echo "## Admin Callback (dev)" >> $GITHUB_STEP_SUMMARY
+          echo "## Admin Callback (${ENVIRONMENT})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Endpoint | \`${ADMIN_CALLBACK_URL}/api/platform/ingest/release-logs\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`${ENVIRONMENT}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| HTTP Status | $HTTP_CODE |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | \`$BRANCH\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Version | \`${{ steps.version.outputs.APP_VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
