@@ -1,0 +1,262 @@
+# Reusable prod-deploy gate.
+# Enforces three invariants BEFORE a prod deploy is allowed:
+#   1. target_version <= dev_version    (can't ship to prod what hasn't been to dev)
+#   2. target_version > prod_version    (no rolling back via prod deploy)
+#   3. dev recorded a release for exactly target_version (dev actually saw this version)
+#
+# Hits admin.triarch.dev:
+#   GET /api/platform/projects/{project_key}/versions
+# expecting JSON:
+#   {
+#     "dev":  { "version": "v3.54.0", "deployed_at": "2026-05-14T00:18:13Z", "commit_sha": "..." } | null,
+#     "prod": { "version": "v3.36.1", "deployed_at": "2026-05-05T03:06:16Z", "commit_sha": "..." } | null
+#   }
+#
+# Fails the job loudly if any invariant violated. No bypass input. Mike asked for
+# "regardless of how many corners I want to cut myself" — no escape hatch is intentional.
+#
+# v8 (2026-05-14). Sibling of deploy-prod.yml. Call BEFORE deploy-prod.yml in
+# consumer workflows:
+#   gate:
+#     uses: triarchsecurity/shared-workflows/.github/workflows/gate-prod-version.yml@v8
+#     with:
+#       project_key: triarchsecurity-admin
+#       target_version: ${{ needs.version.outputs.version }}
+#     secrets:
+#       ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
+#   deploy:
+#     needs: gate
+#     uses: triarchsecurity/shared-workflows/.github/workflows/deploy-prod.yml@v8
+#     ...
+
+name: Gate Prod Version
+
+on:
+  workflow_call:
+    inputs:
+      project_key:
+        description: 'Project key in admin.triarch.dev (e.g. triarchsecurity-admin).'
+        required: true
+        type: string
+      target_version:
+        description: 'Version about to be deployed to prod (e.g. v3.55.0 or 3.55.0).'
+        required: true
+        type: string
+      admin_callback_url:
+        description: 'Base URL for admin control plane. Override for staging/test.'
+        required: false
+        type: string
+        default: 'https://admin.triarch.dev'
+      min_dev_age_seconds:
+        description: 'Minimum age of the dev deploy before prod is allowed. Default 300 (5 min) — gives any post-deploy smoke tests time to run. Set to 0 to disable.'
+        required: false
+        type: number
+        default: 300
+    secrets:
+      ADMIN_API_TOKEN:
+        description: 'Per-project Bearer token for admin callback (projects.apiKey from CRDB).'
+        required: true
+    outputs:
+      dev_version:
+        description: 'Current dev version reported by admin.'
+        value: ${{ jobs.gate.outputs.dev_version }}
+      prod_version:
+        description: 'Current prod version reported by admin (empty if no prod ever recorded).'
+        value: ${{ jobs.gate.outputs.prod_version }}
+      verdict:
+        description: 'pass | fail. fail will have caused the job to exit non-zero already.'
+        value: ${{ jobs.gate.outputs.verdict }}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Gate Prod Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      dev_version: ${{ steps.fetch.outputs.dev_version }}
+      prod_version: ${{ steps.fetch.outputs.prod_version }}
+      verdict: ${{ steps.compare.outputs.verdict }}
+
+    steps:
+      - name: Normalize target version
+        id: normalize
+        env:
+          RAW: ${{ inputs.target_version }}
+        run: |
+          # Strip leading 'v' if present; we compare numeric semver throughout, prefix back for logs.
+          TARGET="${RAW#v}"
+          if ! echo "$TARGET" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::target_version '$RAW' is not a valid semver (X.Y.Z or X.Y.Z-pre)."
+            exit 1
+          fi
+          echo "target_version=$TARGET" >> $GITHUB_OUTPUT
+          echo "Target: v$TARGET"
+
+      - name: Fetch dev + prod versions from admin
+        id: fetch
+        env:
+          ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
+          ADMIN_CALLBACK_URL: ${{ inputs.admin_callback_url }}
+          PROJECT_KEY: ${{ inputs.project_key }}
+        run: |
+          if [ -z "$ADMIN_API_TOKEN" ]; then
+            echo "::error::ADMIN_API_TOKEN not set. Set this Actions secret to projects.apiKey for ${PROJECT_KEY}."
+            exit 1
+          fi
+          URL="${ADMIN_CALLBACK_URL}/api/platform/projects/${PROJECT_KEY}/versions"
+          RESP_BODY=$(mktemp)
+          HTTP_CODE=$(curl -s --max-time 10 -o "$RESP_BODY" -w "%{http_code}" \
+            -X GET "$URL" \
+            -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
+            -H "Accept: application/json" || echo "000")
+          if [ "$HTTP_CODE" != "200" ]; then
+            RESP_TEXT=$(head -c 800 "$RESP_BODY")
+            echo "::error::Admin versions fetch failed (HTTP $HTTP_CODE) at $URL. Body: $RESP_TEXT"
+            rm -f "$RESP_BODY"
+            exit 1
+          fi
+          # Pretty-print for the workflow log so the gate decision is reviewable.
+          echo "--- admin response ---"
+          cat "$RESP_BODY"
+          echo ""
+          # Extract fields with jq. Empty string when null/missing — handled in compare step.
+          DEV_VERSION=$(jq -r '.dev.version // ""' "$RESP_BODY")
+          DEV_DEPLOYED_AT=$(jq -r '.dev.deployed_at // ""' "$RESP_BODY")
+          PROD_VERSION=$(jq -r '.prod.version // ""' "$RESP_BODY")
+          PROD_DEPLOYED_AT=$(jq -r '.prod.deployed_at // ""' "$RESP_BODY")
+          rm -f "$RESP_BODY"
+          # Strip 'v' prefix for numeric comparison.
+          echo "dev_version=${DEV_VERSION#v}" >> $GITHUB_OUTPUT
+          echo "dev_deployed_at=$DEV_DEPLOYED_AT" >> $GITHUB_OUTPUT
+          echo "prod_version=${PROD_VERSION#v}" >> $GITHUB_OUTPUT
+          echo "prod_deployed_at=$PROD_DEPLOYED_AT" >> $GITHUB_OUTPUT
+
+      - name: Compare versions + enforce invariants
+        id: compare
+        env:
+          TARGET: ${{ steps.normalize.outputs.target_version }}
+          DEV: ${{ steps.fetch.outputs.dev_version }}
+          DEV_DEPLOYED_AT: ${{ steps.fetch.outputs.dev_deployed_at }}
+          PROD: ${{ steps.fetch.outputs.prod_version }}
+          PROD_DEPLOYED_AT: ${{ steps.fetch.outputs.prod_deployed_at }}
+          MIN_DEV_AGE: ${{ inputs.min_dev_age_seconds }}
+        run: |
+          set -uo pipefail
+
+          # semver_cmp A B -> echoes -1 (A<B), 0 (A==B), 1 (A>B).
+          # Compares numeric X.Y.Z only — pre-release suffixes ignored for the comparison
+          # (they're permitted in the regex but semver pre-release ordering is out of scope).
+          semver_cmp() {
+            local a="${1%%-*}" b="${2%%-*}"
+            local IFS=.
+            # shellcheck disable=SC2206
+            local a_arr=($a) b_arr=($b)
+            for i in 0 1 2; do
+              local ai="${a_arr[$i]:-0}"
+              local bi="${b_arr[$i]:-0}"
+              if [ "$ai" -lt "$bi" ]; then echo -1; return; fi
+              if [ "$ai" -gt "$bi" ]; then echo 1; return; fi
+            done
+            echo 0
+          }
+
+          FAILED=0
+          REASONS=()
+
+          # Invariant 1: dev must exist
+          if [ -z "$DEV" ]; then
+            FAILED=1
+            REASONS+=("INV-1: no dev release recorded for this project — cannot promote anything to prod yet")
+          fi
+
+          # Invariant 2: target_version <= dev_version (can't ship something dev hasn't seen)
+          if [ -n "$DEV" ]; then
+            CMP=$(semver_cmp "$TARGET" "$DEV")
+            if [ "$CMP" -gt 0 ]; then
+              FAILED=1
+              REASONS+=("INV-2: target v$TARGET is HIGHER than current dev v$DEV — dev must deploy v$TARGET first")
+            fi
+          fi
+
+          # Invariant 3: target_version > prod_version (no rollback via prod deploy)
+          if [ -n "$PROD" ]; then
+            CMP=$(semver_cmp "$TARGET" "$PROD")
+            if [ "$CMP" -le 0 ]; then
+              FAILED=1
+              REASONS+=("INV-3: target v$TARGET is NOT higher than current prod v$PROD — prod can never roll backward; use a hotfix branch with a bumped version instead")
+            fi
+          fi
+
+          # Invariant 4: dev_version must equal target_version (the EXACT version must have hit dev)
+          if [ -n "$DEV" ]; then
+            CMP=$(semver_cmp "$TARGET" "$DEV")
+            if [ "$CMP" -ne 0 ]; then
+              FAILED=1
+              REASONS+=("INV-4: target v$TARGET does not match current dev v$DEV — the exact target version must have been deployed to dev first (no skipping)")
+            fi
+          fi
+
+          # Invariant 5: dev deploy must have aged at least min_dev_age_seconds
+          if [ -n "$DEV_DEPLOYED_AT" ] && [ "$MIN_DEV_AGE" -gt 0 ]; then
+            NOW_TS=$(date -u +%s)
+            DEV_TS=$(date -u -d "$DEV_DEPLOYED_AT" +%s 2>/dev/null || python3 -c "from datetime import datetime; print(int(datetime.fromisoformat('$DEV_DEPLOYED_AT'.replace('Z','+00:00')).timestamp()))" 2>/dev/null || echo 0)
+            if [ "$DEV_TS" -gt 0 ]; then
+              AGE=$(( NOW_TS - DEV_TS ))
+              if [ "$AGE" -lt "$MIN_DEV_AGE" ]; then
+                FAILED=1
+                REASONS+=("INV-5: dev deploy of v$DEV is ${AGE}s old (< required ${MIN_DEV_AGE}s) — let dev bake before promoting to prod")
+              fi
+            fi
+          fi
+
+          {
+            echo "## Prod Gate"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Project | \`${{ inputs.project_key }}\` |"
+            echo "| Target version | \`v$TARGET\` |"
+            echo "| Current dev | \`v${DEV:-(none)}\` (${DEV_DEPLOYED_AT:-no record}) |"
+            echo "| Current prod | \`v${PROD:-(none)}\` (${PROD_DEPLOYED_AT:-no record}) |"
+            echo "| Min dev age (s) | $MIN_DEV_AGE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILED" -eq 0 ]; then
+            echo "| Verdict | ✅ PASS |" >> "$GITHUB_STEP_SUMMARY"
+            echo "verdict=pass" >> $GITHUB_OUTPUT
+            echo "✅ Gate PASS: prod deploy of v$TARGET authorized."
+          else
+            echo "| Verdict | ❌ BLOCKED |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Reasons" >> "$GITHUB_STEP_SUMMARY"
+            for r in "${REASONS[@]}"; do
+              echo "- $r" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::$r"
+            done
+            echo "verdict=fail" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Audit log to admin
+        if: always()
+        continue-on-error: true
+        env:
+          ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
+          ADMIN_CALLBACK_URL: ${{ inputs.admin_callback_url }}
+          PROJECT_KEY: ${{ inputs.project_key }}
+          TARGET: ${{ steps.normalize.outputs.target_version }}
+          DEV: ${{ steps.fetch.outputs.dev_version }}
+          PROD: ${{ steps.fetch.outputs.prod_version }}
+          VERDICT: ${{ steps.compare.outputs.verdict }}
+        run: |
+          [ -z "$ADMIN_API_TOKEN" ] && exit 0
+          PAYLOAD=$(printf '{"action":"deploy_gate_check","tool":"shared-workflows/gate-prod-version","reason":"prod deploy gate","metadata":{"project_key":"%s","target_version":"v%s","dev_version":"v%s","prod_version":"v%s","verdict":"%s","run_id":"%s","actor":"%s"}}' \
+            "$PROJECT_KEY" "$TARGET" "${DEV:-}" "${PROD:-}" "${VERDICT:-fail}" "${{ github.run_id }}" "${{ github.actor }}")
+          curl -s --max-time 5 \
+            -X POST "${ADMIN_CALLBACK_URL}/api/platform/audit" \
+            -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" > /dev/null 2>&1 || true
