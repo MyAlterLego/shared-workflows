@@ -5,12 +5,21 @@
 #   3. dev recorded a release for exactly target_version (dev actually saw this version)
 #
 # Hits admin.triarch.dev:
-#   GET /api/platform/projects/{project_key}/versions
-# expecting JSON:
+#   GET /api/platform/version-snapshot
+# Project is derived from the Bearer apiKey (per requireApiKey on the admin side).
+# inputs.project_key is for logging/audit only — it's NOT in the URL.
+#
+# Expected response JSON:
 #   {
-#     "dev":  { "version": "v3.54.0", "deployed_at": "2026-05-14T00:18:13Z", "commit_sha": "..." } | null,
-#     "prod": { "version": "v3.36.1", "deployed_at": "2026-05-05T03:06:16Z", "commit_sha": "..." } | null
+#     "project": "<key>",
+#     "dev":  { "version": "v3.54.0", "deployed_at": "2026-05-14T00:18:13Z" } | null,
+#     "prod": { "version": "v3.36.1", "deployed_at": "2026-05-05T03:06:16Z" } | null
 #   }
+#
+# v8.1 (2026-05-14): switched from /api/platform/projects/{key}/versions to
+# /api/platform/version-snapshot. The dynamic-segment path crashed FAH at
+# runtime (suspected route conflict with static siblings). Static-path
+# version is healthy.
 #
 # Fails the job loudly if any invariant violated. No bypass input. Mike asked for
 # "regardless of how many corners I want to cut myself" — no escape hatch is intentional.
@@ -106,7 +115,8 @@ jobs:
             echo "::error::ADMIN_API_TOKEN not set. Set this Actions secret to projects.apiKey for ${PROJECT_KEY}."
             exit 1
           fi
-          URL="${ADMIN_CALLBACK_URL}/api/platform/projects/${PROJECT_KEY}/versions"
+          # v8.1: static-path endpoint; project derived from Bearer apiKey.
+          URL="${ADMIN_CALLBACK_URL}/api/platform/version-snapshot"
           RESP_BODY=$(mktemp)
           HTTP_CODE=$(curl -s --max-time 10 -o "$RESP_BODY" -w "%{http_code}" \
             -X GET "$URL" \
