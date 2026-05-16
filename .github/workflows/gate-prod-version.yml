@@ -16,6 +16,12 @@
 #     "prod": { "version": "v3.36.1", "deployed_at": "2026-05-05T03:06:16Z" } | null
 #   }
 #
+# v8.2 (2026-05-16): adds POST /api/platform/cicd/gate-verdict step for CL-6
+# paired-verdict enforcement. The step fires on every gate run (pass + fail
+# via `if: always()`) so Phase 27's ingest pre-check has a verdict row to
+# match. `continue-on-error: true` means admin downtime never blocks a deploy
+# — the worst case is a missed audit row, not a wedged pipeline.
+#
 # v8.1 (2026-05-14): switched from /api/platform/projects/{key}/versions to
 # /api/platform/version-snapshot. The dynamic-segment path crashed FAH at
 # runtime (suspected route conflict with static siblings). Static-path
@@ -249,6 +255,57 @@ jobs:
             echo "verdict=fail" >> $GITHUB_OUTPUT
             exit 1
           fi
+
+      - name: Record verdict to admin (CL-6)
+        if: always()
+        continue-on-error: true
+        env:
+          ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
+          ADMIN_CALLBACK_URL: ${{ inputs.admin_callback_url }}
+          PROJECT_KEY: ${{ inputs.project_key }}
+          TARGET: ${{ steps.normalize.outputs.target_version }}
+          DEV: ${{ steps.fetch.outputs.dev_version }}
+          VERDICT: ${{ steps.compare.outputs.verdict }}
+        run: |
+          # CL-6 paired-verdict POST (Phase 27 + 28). Writes a deploy_gate_check
+          # row that POST /api/platform/ingest/release-logs reads inside its
+          # 15-min lookback to enforce CL-6 server-side. continue-on-error
+          # keeps admin outages from blocking deploys; the missed audit row
+          # surfaces as a CL-6 violation flag on the next ingest, not a
+          # wedged pipeline.
+          if [ -z "$ADMIN_API_TOKEN" ]; then
+            echo "::warning::ADMIN_API_TOKEN missing — skipping CL-6 verdict POST"
+            exit 0
+          fi
+          # verdict defaults to 'fail' if the compare step didn't set it
+          # (e.g. fetch step failed). Server only accepts 'pass' or 'fail'.
+          VERDICT_VALUE="${VERDICT:-fail}"
+          # dev_version may be empty when INV-1 fired (no dev recorded);
+          # endpoint requires a non-empty string, so substitute a sentinel.
+          DEV_VALUE="${DEV:-none}"
+          URL="${ADMIN_CALLBACK_URL}/api/platform/cicd/gate-verdict"
+          PAYLOAD=$(printf '{"target_version":"v%s","verdict":"%s","dev_version":"v%s","workflow_run_url":"%s/%s/actions/runs/%s"}' \
+            "$TARGET" \
+            "$VERDICT_VALUE" \
+            "$DEV_VALUE" \
+            "${GITHUB_SERVER_URL}" \
+            "${GITHUB_REPOSITORY}" \
+            "${GITHUB_RUN_ID}")
+          echo "POSTing CL-6 verdict to $URL"
+          RESP_BODY=$(mktemp)
+          HTTP_CODE=$(curl -s --max-time 5 -o "$RESP_BODY" -w "%{http_code}" \
+            -X POST "$URL" \
+            -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" || echo "000")
+          if [ "$HTTP_CODE" = "201" ]; then
+            echo "CL-6 verdict recorded (HTTP 201)"
+          else
+            RESP_TEXT=$(head -c 400 "$RESP_BODY" 2>/dev/null || echo '')
+            echo "::warning::CL-6 verdict POST failed (HTTP $HTTP_CODE) at $URL — body: $RESP_TEXT"
+            echo "::warning::This is non-blocking; the missing pair will surface as a CL-6 violation on the next prod ingest."
+          fi
+          rm -f "$RESP_BODY"
 
       - name: Audit log to admin
         if: always()
