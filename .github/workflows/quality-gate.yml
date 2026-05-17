@@ -160,6 +160,68 @@ jobs:
             tests/**/*.md
           retention-days: 30
 
+  # ---------------------------------------------------------------- version consistency (added v9.0)
+  # Fails fast (~5s) if package.json, package-lock.json, and src/lib/version.ts
+  # (if it exists) have drifted apart. Each is a source-of-truth for the same
+  # number; humans forgetting to keep them in sync was the #2 drift issue
+  # uncovered during the 2026-05-17 framework-portability audit.
+  #
+  # The check is purely additive — if package-lock.json is missing (rare),
+  # or version.ts is missing (most repos), the corresponding assertion is
+  # silently skipped.
+  version-consistency:
+    name: version-consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: package.json ↔ package-lock.json version match
+        run: |
+          if [ ! -f package.json ]; then
+            echo "No package.json at repo root — skipping (this isn't a Node project)."
+            exit 0
+          fi
+          PJ=$(node -p "require('./package.json').version" 2>/dev/null)
+          if [ -z "$PJ" ]; then echo "::error::Could not read package.json version"; exit 1; fi
+          if [ -f package-lock.json ]; then
+            PL_TOP=$(node -p "require('./package-lock.json').version" 2>/dev/null)
+            PL_PKG=$(node -p "require('./package-lock.json').packages[''].version || ''" 2>/dev/null)
+            if [ "$PJ" != "$PL_TOP" ] || [ "$PJ" != "$PL_PKG" ]; then
+              echo "::error::Version mismatch detected:"
+              echo "::error::  package.json version           = $PJ"
+              echo "::error::  package-lock.json .version     = $PL_TOP"
+              echo "::error::  package-lock.json packages[''] = $PL_PKG"
+              echo "::error::Fix: run 'npm install' locally and commit the updated package-lock.json."
+              exit 1
+            fi
+            echo "package.json ($PJ) and package-lock.json are in sync."
+          else
+            echo "No package-lock.json at root — skipping lockfile check."
+          fi
+      - name: package.json ↔ src/lib/version.ts match (if version.ts exists)
+        run: |
+          if [ ! -f src/lib/version.ts ]; then
+            echo "No src/lib/version.ts — skipping version.ts check."
+            exit 0
+          fi
+          PJ=$(node -p "require('./package.json').version" 2>/dev/null)
+          # version.ts convention: `export const APP_VERSION = 'v3.60.3'` or similar.
+          # Extract the first semver-looking string with optional 'v' prefix.
+          VT_RAW=$(grep -oE "['\"]v?[0-9]+\.[0-9]+\.[0-9]+['\"]" src/lib/version.ts | head -1 | tr -d "'\"")
+          VT="${VT_RAW#v}"
+          if [ -z "$VT" ]; then
+            echo "::warning::Could not extract a semver from src/lib/version.ts — skipping. Pattern expected: 'vX.Y.Z' or 'X.Y.Z'."
+            exit 0
+          fi
+          if [ "$PJ" != "$VT" ]; then
+            echo "::error::Version mismatch detected:"
+            echo "::error::  package.json version  = $PJ"
+            echo "::error::  src/lib/version.ts    = $VT"
+            echo "::error::Fix: update src/lib/version.ts so the version constant matches package.json."
+            exit 1
+          fi
+          echo "package.json ($PJ) and src/lib/version.ts are in sync."
+
   # ---------------------------------------------------------------- security scanning (added v1.7)
   # Runs in parallel with `gate` for speed. Findings appear in the workflow log.
   # No SARIF upload (would require GHAS / Code Security, which org Free + Team
