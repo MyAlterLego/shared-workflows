@@ -1,6 +1,6 @@
 name: Wait for Firebase App Hosting Rollout
 
-# Polls Firebase App Hosting for the most recent rollout on the given backend
+# Polls Firebase App Hosting for the rollout matching the caller's commit SHA
 # until it reaches a terminal state (SUCCEEDED / FAILED / CANCELLED) or the
 # timeout elapses.
 #
@@ -9,12 +9,20 @@ name: Wait for Firebase App Hosting Rollout
 # the deploy step to be visible in the GitHub Actions pipeline graph.
 # This is OBSERVABILITY only — it doesn't run `firebase deploy`. FAH does.
 #
-# For repos that explicitly run `firebase deploy --only apphosting` from a
-# job (Pattern B), you don't need this — the deploy job IS the deploy.
+# Implementation note (2026-05-17): The earlier version of this workflow used
+# `firebase apphosting:rollouts:list` which IS NOT A VALID FIREBASE CLI
+# COMMAND (only `apphosting:backends:list/get` and `apphosting:rollouts:create`
+# exist). The list call always failed silently, the script swallowed the
+# error with `|| echo "[]"`, parsed empty JSON, computed state=UNKNOWN, and
+# exited 5 — making every successful FAH deploy look like a CI failure.
+# This rewrite calls the FAH REST API directly (same endpoint used by the
+# Firebase Console). It also matches the rollout to the caller's commit SHA
+# via the build resource's source.codebase.hash so parallel deploys don't
+# confuse each other.
 #
 # Caller pattern:
 #   jobs:
-#     quality-gate: { uses: shared-workflows/quality-gate.yml@v1, ... }
+#     quality-gate: { uses: shared-workflows/quality-gate.yml@v9.0, ... }
 #     deploy:
 #       needs: quality-gate
 #       if: github.event_name == 'push'
@@ -43,6 +51,10 @@ on:
         required: true
         type: string
         description: 'FAH backend name (e.g. tmi)'
+      location:
+        type: string
+        default: 'us-central1'
+        description: 'FAH backend region'
       timeout_seconds:
         type: number
         default: 600
@@ -51,17 +63,24 @@ on:
         type: number
         default: 15
         description: 'How often to poll FAH for rollout state'
+      match_commit:
+        type: boolean
+        default: true
+        description: 'When true, only consider rollouts whose build was triggered by github.sha. When false, take the most recent rollout regardless of commit.'
     secrets:
       FIREBASE_SA_KEY:
         required: true
         description: 'GCP service-account JSON for Firebase auth'
     outputs:
       rollout_status:
-        description: 'Final FAH rollout state: success / failure / cancelled / timeout / unknown'
+        description: 'Final FAH rollout state: success / failure / cancelled / timeout / no_rollout / unknown'
         value: ${{ jobs.wait.outputs.status }}
       rollout_duration_seconds:
-        description: 'Wall-clock seconds spent polling (≈ FAH rollout duration when success)'
+        description: 'Wall-clock seconds spent polling'
         value: ${{ jobs.wait.outputs.duration }}
+      rollout_name:
+        description: 'Final FAH rollout resource name (e.g. rollout-2026-05-17-006). Empty when no rollout matched.'
+        value: ${{ jobs.wait.outputs.rollout }}
 
 permissions:
   contents: read
@@ -74,6 +93,7 @@ jobs:
     outputs:
       status: ${{ steps.poll.outputs.STATUS }}
       duration: ${{ steps.poll.outputs.DURATION }}
+      rollout: ${{ steps.poll.outputs.ROLLOUT }}
 
     steps:
       - name: Authenticate to Google Cloud
@@ -84,45 +104,110 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Install Firebase CLI
-        run: npm install -g firebase-tools
-
-      - name: Poll Firebase App Hosting for rollout completion
+      - name: Poll FAH REST API for rollout completion
         id: poll
         env:
           FIREBASE_PROJECT_ID: ${{ inputs.firebase_project_id }}
           FAH_BACKEND: ${{ inputs.app_hosting_backend }}
+          FAH_LOCATION: ${{ inputs.location }}
           TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
           POLL_INTERVAL: ${{ inputs.poll_interval_seconds }}
+          MATCH_COMMIT: ${{ inputs.match_commit }}
           GH_SHA: ${{ github.sha }}
         run: |
           set -uo pipefail
           START=$(date +%s)
           DEADLINE=$((START + TIMEOUT_SECONDS))
+          BASE="https://firebaseapphosting.googleapis.com/v1beta/projects/${FIREBASE_PROJECT_ID}/locations/${FAH_LOCATION}/backends/${FAH_BACKEND}"
 
-          echo "Watching FAH backend '${FAH_BACKEND}' on project '${FIREBASE_PROJECT_ID}'"
-          echo "Looking for rollout matching commit ${GH_SHA:0:8}"
+          echo "Watching FAH backend '${FAH_BACKEND}' on project '${FIREBASE_PROJECT_ID}' (region ${FAH_LOCATION})"
+          if [ "${MATCH_COMMIT}" = "true" ]; then
+            echo "Matching rollouts whose build source.codebase.hash == ${GH_SHA}"
+          else
+            echo "Matching the most recent rollout (no commit filter)"
+          fi
           echo "Timeout: ${TIMEOUT_SECONDS}s; poll interval: ${POLL_INTERVAL}s"
           echo ""
 
           STATUS="unknown"
-          while true; do
-            # Fetch most recent rollout. firebase apphosting:rollouts:list returns JSON array
-            # ordered most-recent-first. Tolerate empty/transient errors with `|| true`.
-            ROLLOUTS=$(firebase apphosting:rollouts:list \
-              --project="$FIREBASE_PROJECT_ID" \
-              --backend="$FAH_BACKEND" \
-              --json 2>/dev/null || echo "[]")
+          ROLLOUT_NAME=""
+          # Cache build→commit lookups across polls to avoid hammering the API
+          BUILD_CACHE=$(mktemp)
 
-            # Some firebase CLI versions return a wrapper {result:[...]}; normalize.
-            FIRST=$(echo "$ROLLOUTS" | jq -r 'if type=="array" then .[0] else (.result // [])[0] // empty end' 2>/dev/null)
-            STATE=$(echo "$FIRST" | jq -r '.state // "UNKNOWN"' 2>/dev/null)
+          while true; do
+            TOKEN=$(gcloud auth print-access-token 2>/dev/null)
+            if [ -z "${TOKEN}" ]; then
+              echo "::error::Failed to obtain gcloud access token"
+              STATUS="unknown"
+              break
+            fi
+
+            # Fetch up to 50 rollouts; sort client-side by createTime DESC.
+            # FAH API does not guarantee ordering in the list response.
+            ROLLOUTS=$(curl -sS --max-time 30 \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "${BASE}/rollouts?pageSize=50" 2>/dev/null || echo '{"rollouts":[]}')
+
+            # Pick a candidate rollout:
+            #   - If MATCH_COMMIT=true: find the most recent rollout whose build's source.codebase.hash == GH_SHA
+            #   - Otherwise: the most recent rollout regardless of commit
+            # Strategy: list candidates from most recent down, fetch each build once to learn commit.
+            CANDIDATE=$(echo "${ROLLOUTS}" | jq -r '
+              (.rollouts // [])
+              | sort_by(.createTime) | reverse
+              | .[] | [.name, .state, .build, .createTime] | @tsv
+            ' 2>/dev/null)
+
+            STATE=""
+            ROLLOUT_NAME=""
+            ROLLOUT_BUILD=""
+            ROLLOUT_CREATE=""
+
+            if [ -z "${CANDIDATE}" ]; then
+              echo "[t+$(( $(date +%s) - START ))s] No rollouts found yet"
+            else
+              while IFS=$'\t' read -r NAME ST BUILD CT; do
+                [ -z "${NAME}" ] && continue
+                if [ "${MATCH_COMMIT}" = "true" ]; then
+                  # Look up this build's commit SHA (cached)
+                  CACHED=$(grep -m1 "^${BUILD}	" "${BUILD_CACHE}" 2>/dev/null | cut -f2)
+                  if [ -z "${CACHED}" ]; then
+                    BUILD_NAME=$(basename "${BUILD}")
+                    BUILD_JSON=$(curl -sS --max-time 15 \
+                      -H "Authorization: Bearer ${TOKEN}" \
+                      "${BASE}/builds/${BUILD_NAME}" 2>/dev/null || echo '{}')
+                    SHA=$(echo "${BUILD_JSON}" | jq -r '.source.codebase.hash // empty' 2>/dev/null)
+                    CACHED="${SHA:-NONE}"
+                    echo "${BUILD}	${CACHED}" >> "${BUILD_CACHE}"
+                  fi
+                  if [ "${CACHED}" = "${GH_SHA}" ]; then
+                    STATE="${ST}"
+                    ROLLOUT_NAME=$(basename "${NAME}")
+                    ROLLOUT_BUILD="${BUILD}"
+                    ROLLOUT_CREATE="${CT}"
+                    break
+                  fi
+                else
+                  # No commit filter — take the first (most recent)
+                  STATE="${ST}"
+                  ROLLOUT_NAME=$(basename "${NAME}")
+                  ROLLOUT_BUILD="${BUILD}"
+                  ROLLOUT_CREATE="${CT}"
+                  break
+                fi
+              done <<< "${CANDIDATE}"
+            fi
 
             NOW=$(date +%s)
             ELAPSED=$((NOW - START))
-            echo "[t+${ELAPSED}s] FAH rollout state: ${STATE}"
 
-            case "$STATE" in
+            if [ -z "${STATE}" ]; then
+              echo "[t+${ELAPSED}s] No matching rollout for commit ${GH_SHA:0:8} yet (FAH may not have started the build)"
+            else
+              echo "[t+${ELAPSED}s] ${ROLLOUT_NAME} state=${STATE} (created ${ROLLOUT_CREATE})"
+            fi
+
+            case "${STATE}" in
               READY|SUCCEEDED)
                 STATUS="success"
                 break ;;
@@ -132,29 +217,52 @@ jobs:
               CANCELLED)
                 STATUS="cancelled"
                 break ;;
-              # PENDING, BUILDING, DEPLOYING, etc. — keep polling
+              # PENDING, BUILDING, DEPLOYING, "" (no match yet) — keep polling
               *) ;;
             esac
 
-            if [ "$NOW" -ge "$DEADLINE" ]; then
-              STATUS="timeout"
-              echo "::warning::FAH polling timed out after ${TIMEOUT_SECONDS}s; last state=${STATE}"
+            if [ "${NOW}" -ge "${DEADLINE}" ]; then
+              if [ -z "${STATE}" ]; then
+                STATUS="no_rollout"
+                echo "::warning::No FAH rollout for commit ${GH_SHA} appeared within ${TIMEOUT_SECONDS}s. Backend may not be wired to this branch in Firebase Console."
+              else
+                STATUS="timeout"
+                echo "::warning::FAH polling timed out after ${TIMEOUT_SECONDS}s; last state=${STATE}"
+              fi
               break
             fi
 
-            sleep "$POLL_INTERVAL"
+            sleep "${POLL_INTERVAL}"
           done
 
-          DURATION=$((NOW - START))
+          DURATION=$(( $(date +%s) - START ))
           echo ""
           echo "Final FAH rollout status: ${STATUS} (after ${DURATION}s)"
+          [ -n "${ROLLOUT_NAME}" ] && echo "Matched rollout: ${ROLLOUT_NAME}"
 
-          echo "STATUS=${STATUS}" >> "$GITHUB_OUTPUT"
-          echo "DURATION=${DURATION}" >> "$GITHUB_OUTPUT"
+          {
+            echo "STATUS=${STATUS}"
+            echo "DURATION=${DURATION}"
+            echo "ROLLOUT=${ROLLOUT_NAME}"
+          } >> "${GITHUB_OUTPUT}"
+
+          # Optional summary for the Actions UI
+          {
+            echo "## FAH Rollout Watch"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Backend | \`${FAH_BACKEND}\` |"
+            echo "| Project | \`${FIREBASE_PROJECT_ID}\` |"
+            echo "| Commit | \`${GH_SHA:0:12}\` |"
+            echo "| Rollout | \`${ROLLOUT_NAME:-(none)}\` |"
+            echo "| Status | **${STATUS}** |"
+            echo "| Duration | ${DURATION}s |"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
           # Fail the job on non-success terminal states so the pipeline graph turns red.
           # `notify` job downstream uses `if: always()` so it still fires.
-          case "$STATUS" in
+          case "${STATUS}" in
             success) exit 0 ;;
             *)       exit 1 ;;
           esac
