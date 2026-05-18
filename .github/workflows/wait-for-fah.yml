@@ -115,6 +115,14 @@ jobs:
           MATCH_COMMIT: ${{ inputs.match_commit }}
           GH_SHA: ${{ github.sha }}
         run: |
+          # GitHub Actions invokes this as `bash -e {0}` by default, which means
+          # `set -e` is on. Inside command substitution (`TOKEN=$(gcloud ...)`)
+          # any non-zero exit code kills the script silently — observed as a
+          # 1.9-second-and-out failure with no diagnostic output. Explicitly
+          # disable set -e here; we want to inspect command outputs and decide
+          # control flow ourselves (this loop is supposed to TOLERATE transient
+          # gcloud/API failures and keep polling).
+          set +e
           set -uo pipefail
           START=$(date +%s)
           DEADLINE=$((START + TIMEOUT_SECONDS))
@@ -134,10 +142,26 @@ jobs:
           # Cache build→commit lookups across polls to avoid hammering the API
           BUILD_CACHE=$(mktemp)
 
+          # Print env diagnostics ONCE before the loop — invaluable when this fails in CI.
+          echo "gcloud version: $(gcloud --version 2>&1 | head -1)"
+          echo "GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-(unset)}"
+          echo ""
+
           while true; do
-            TOKEN=$(gcloud auth print-access-token 2>/dev/null)
-            if [ -z "${TOKEN}" ]; then
-              echo "::error::Failed to obtain gcloud access token"
+            # google-github-actions/auth@v2 writes a JSON key file and points
+            # GOOGLE_APPLICATION_CREDENTIALS at it (Application Default Credentials).
+            # `gcloud auth print-access-token` uses gcloud's own auth list (different
+            # mechanism) and returns empty in this environment. Use ADC explicitly,
+            # with the legacy form as a defensive fallback for any future runner change.
+            TOKEN=$(gcloud auth application-default print-access-token 2>&1)
+            TOKEN_RC=$?
+            if [ $TOKEN_RC -ne 0 ] || [ -z "${TOKEN}" ] || echo "${TOKEN}" | grep -qi "error"; then
+              echo "::warning::application-default token fetch failed (rc=$TOKEN_RC), trying gcloud auth print-access-token"
+              TOKEN=$(gcloud auth print-access-token 2>&1)
+              TOKEN_RC=$?
+            fi
+            if [ $TOKEN_RC -ne 0 ] || [ -z "${TOKEN}" ] || echo "${TOKEN}" | grep -qi "error"; then
+              echo "::error::Failed to obtain gcloud access token (rc=$TOKEN_RC). Output: ${TOKEN:0:200}"
               STATUS="unknown"
               break
             fi
